@@ -3,8 +3,8 @@
 
 > **Project:** bluTruth (intentional spelling)
 > **Mission:** The first tool that correlates all Bluetooth diagnostic streams simultaneously — HCI events, D-Bus signals, kernel traces, and daemon logs — into a unified, timestamped, queryable timeline.
-> **Status:** Discovery Phase → Architecture Definition
-> **Date:** 2026-02-23
+> **Status:** Discovery Phase → Python Implementation (Rust port planned)
+> **Date:** 2026-02-27 (updated)
 
 ---
 
@@ -644,17 +644,67 @@ Events are stored in SQLite and streamed to both the TUI and HTTP interface in r
          +--------------+---------------+
          |              |               |
   +------v------+ +-----v------+ +------v-----+
-  |  SQLite DB  | | TUI (Rust/ | | HTTP API   |
-  | (timeline)  | |  Textual)  | | + Web UI   |
+  |  SQLite DB  | | TUI (Python| | HTTP API   |
+  | + JSONL log | |  Textual)  | | + Web UI   |
   +-------------+ +------------+ +------------+
                         |               |
                  +------v------+ +------v------+
-                 | bttui.py    | | blutruth.js |
-                 | (existing)  | |  React SPA  |
+                 | bttui.py    | | Progressive |
+                 | (existing)  | |  HTML + SSE |
                  +-------------+ +-------------+
 ```
 
 ### Data Collection Layer
+
+#### Collector Plugin Interface
+
+Every data source is implemented as a collector plugin conforming to a standard interface. This is the primary extension point — adding a new diagnostic source means writing a new collector, nothing else.
+
+```python
+class Collector(ABC):
+    """Base interface for all diagnostic stream collectors."""
+
+    name: str               # unique identifier (e.g., "hci", "dbus", "journalctl")
+    description: str        # human-readable purpose
+
+    @abstractmethod
+    async def start(self) -> None: ...
+
+    @abstractmethod
+    async def stop(self) -> None: ...
+
+    @abstractmethod
+    def enabled(self) -> bool: ...
+
+    def capabilities(self) -> dict:
+        """Declare what this collector requires and provides.
+        Used by the runtime to check prerequisites, warn about
+        degraded visibility, and order startup dependencies."""
+        return {
+            "requires_root": False,
+            "requires_debugfs": False,
+            "exclusive_resource": None,    # e.g., "hci_monitor_socket" for btmon
+            "optional_root_benefits": [],  # what you gain with root
+            "provides": [],                # event source tags this emits
+            "depends_on": [],              # other collector names needed first
+        }
+```
+
+When the runtime starts, it checks each collector's `capabilities()` to determine what can run in the current environment. If running without root, collectors that `requires_root` are disabled with a visible notice listing what visibility is lost. Collectors declaring `exclusive_resource` are managed by the runtime to prevent conflicts (e.g., only one btmon consumer owns the HCI monitor socket, with fan-out to subscribers).
+
+#### Tier-0 streams (always available, minimum viable diagnosis)
+
+- **btmon/HCI monitor** — requires the HCI monitor socket; bluTruth owns it and fans out to subscribers
+- **D-Bus signals** — `org.bluez` property changes, interface add/remove
+- **bluetoothd logs** — journalctl follow (default) or managed debug daemon (advanced mode)
+
+#### Tier-1 streams (optional, enhanced visibility)
+
+- **Kernel trace events** — requires root + debugfs
+- **dmesg** — firmware load events, driver init errors
+- **sysfs/proc snapshots** — adapter state, open sockets
+
+New collectors can be added without modifying core code. A collector that emits events in the canonical schema is automatically integrated into the correlation engine, storage, and UI.
 
 #### HCI Broadcaster
 
@@ -662,46 +712,55 @@ The btmon broadcaster singleton already built in `bttui.py`. Extend to output st
 
 #### D-Bus Monitor (new — core of bluTruth)
 
-Python implementation using `dbus-python`:
+Python implementation using `dbus-next` (pure Python, no C extensions, async-native):
 
 ```python
+from dbus_next.aio import MessageBus
+from dbus_next.constants import BusType
+from dbus_next import Message
+
 class DBusMonitor:
     def __init__(self, event_queue):
-        self.bus = dbus.SystemBus()
         self.queue = event_queue
+        self.bus = None
 
-        # Watch all PropertiesChanged signals under /org/bluez
-        self.bus.add_signal_receiver(
-            self._on_properties_changed,
-            dbus_interface="org.freedesktop.DBus.Properties",
-            signal_name="PropertiesChanged",
-            path_namespace="/org/bluez",
-            sender_keyword="sender",
-            path_keyword="path",
-        )
+    async def start(self):
+        self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
 
-        # Watch device appear/disappear
-        self.bus.add_signal_receiver(
-            self._on_interfaces_added,
-            dbus_interface="org.freedesktop.DBus.ObjectManager",
-            signal_name="InterfacesAdded",
-        )
-        self.bus.add_signal_receiver(
-            self._on_interfaces_removed,
-            dbus_interface="org.freedesktop.DBus.ObjectManager",
-            signal_name="InterfacesRemoved",
-        )
+        # Subscribe broadly to all BlueZ signals
+        match = "type='signal',sender='org.bluez'"
+        await self.bus.call(Message(
+            destination="org.freedesktop.DBus",
+            path="/org/freedesktop/DBus",
+            interface="org.freedesktop.DBus",
+            member="AddMatch",
+            signature="s",
+            body=[match],
+        ))
 
-    def _on_properties_changed(self, interface, changed, invalidated,
-                                sender=None, path=None):
-        event = {
-            "ts": time.time(),
-            "source": "DBUS",
-            "path": path,
-            "interface": interface,
-            "changed": {str(k): str(v) for k, v in changed.items()},
+        # Handler normalizes signals into canonical events
+        def on_message(msg):
+            if msg.message_type.name != "SIGNAL":
+                return
+            event = {
+                "ts": time.monotonic(),
+                "source": "DBUS",
+                "path": msg.path,
+                "interface": msg.interface,
+                "member": msg.member,
+                "body": msg.body,
+            }
+            self.queue.put_nowait(event)
+
+        self.bus.add_message_handler(on_message)
+
+    def capabilities(self):
+        return {
+            "requires_root": False,
+            "requires_debugfs": False,
+            "exclusive_resource": None,
+            "provides": ["DBUS"],
         }
-        self.queue.put(event)
 ```
 
 Rust implementation using `zbus`:
@@ -719,9 +778,11 @@ let stream = MessageStream::from(&connection);
 
 Already built. Integrate as the static probe that runs at startup and on demand. Probe results appear in the timeline as SYSFS-tagged snapshot events.
 
-#### bluetoothd debug log capture
+#### bluetoothd log capture
 
-For maximum visibility, bluTruth should optionally manage bluetoothd itself — launch it as a subprocess with the `-d` flag and capture stdout/stderr directly. For systems where the daemon runs under systemd, capture via `journalctl -f -u bluetooth`.
+**Default mode (journalctl follow):** Keeps the system's `bluetooth.service` running normally and collects logs via `journalctl -u bluetooth -f -o json`. Non-disruptive, production-friendly, works with existing system configuration. Limited to whatever verbosity bluetoothd is configured to log.
+
+**Advanced mode (managed debug daemon):** bluTruth optionally stops the system service and runs `bluetoothd -n -d` under its own control for maximum verbosity. This mode is opt-in only (disabled by default in config), requires explicit user confirmation, and warns that it will disrupt active Bluetooth connections. On exit, bluTruth restores the system service. This mode is gated behind `collectors.advanced_bluetoothd.enabled: true` in the YAML config.
 
 #### Kernel trace collector
 
@@ -737,7 +798,28 @@ The core algorithmic component.
 
 **Timestamp normalization** — all sources use different clock sources. btmon uses `CLOCK_REALTIME`. D-Bus signals have system time. Kernel traces use monotonic clock. The correlation engine normalizes all to a common reference using boot time as the anchor.
 
-**Event linking** — when a D-Bus `Connected: false` appears, find the btmon `Disconnect Complete` event within ±50ms and link them as the same logical event with different perspectives. A single connection failure should appear as one grouped event with four sub-perspectives rather than four unrelated log lines.
+**Event linking** — when a D-Bus `Connected: false` appears, find the btmon `Disconnect Complete` event within ±100ms (configurable) and link them as the same logical event with different perspectives. A single connection failure should appear as one grouped event with four sub-perspectives rather than four unrelated log lines.
+
+**Rule-pack driven correlation** — correlation heuristics and anomaly signatures are defined as declarative YAML rule packs rather than hardcoded logic. This is a major long-term stability lever because BlueZ behavior shifts across versions and kernel updates. Rule packs can be updated, shared, and version-controlled independently of the core code.
+
+```yaml
+# Example rule: link HCI disconnect to D-Bus property change
+- name: disconnect_correlation
+  description: "Link HCI Disconnect Complete to D-Bus Connected: false"
+  match:
+    primary:
+      source: HCI
+      event_type: HCI_EVT
+      summary_contains: "Disconnect Complete"
+    correlated:
+      source: DBUS
+      event_type: DBUS_PROP
+      summary_contains: "Connected"
+  time_window_ms: 100
+  link_by: device_addr
+```
+
+Rule packs live in `~/.blutruth/rules/` and are loaded at startup and on config hot-reload. New rules take effect immediately against incoming events without restarting the daemon.
 
 **Device address resolution** — BLE devices use random addresses that rotate. The IRK stored in the pairing database resolves random addresses to known device identities. The correlation engine should resolve addresses so events from the same device are grouped regardless of address rotation.
 
@@ -747,24 +829,50 @@ The core algorithmic component.
 
 ### Storage Layer
 
-SQLite — single file, zero config, embeds in the process. Fast enough for BT event rates (100–500 events/sec peak during connection establishment).
+#### Dual storage: SQLite + JSONL flight recorder
+
+All events are written to both stores simultaneously. SQLite is the query/index layer for the UI and correlation engine. JSONL is the append-only flight recorder for portability, sharing, and future-proofing.
+
+**JSONL flight recorder** — one JSON object per line, canonical event format. Append-only, never modified. Can be parsed with `jq`, Python, Rust, or anything. Attach to a bug report. Survives schema migrations because it captures the complete event as-written. Stored alongside the SQLite database (e.g., `~/.blutruth/events.jsonl`).
+
+**SQLite** — single file, zero config, embeds in the process. Fast enough for BT event rates (100–500 events/sec peak during connection establishment). WAL mode for concurrent read/write access.
+
+#### Canonical event schema
+
+The event schema is the primary compatibility contract. Collectors change, parsers change, the UI changes — the event format stays stable and versioned.
+
+Versioning fields:
+- `schema_version` — the overall event format version. Bumped on breaking changes.
+- `source_version` — version of the collector that produced this event (e.g., "hci-collector-1.2"). Allows consumers to know which parser produced the data.
+- `parser_version` — version of the normalization/parsing logic applied. Distinct from source_version because the same raw data can be re-parsed with updated logic.
+
+These three version fields together mean you can always determine exactly what code produced an event, which is critical for the Rust migration — Python-collected and Rust-collected events can coexist in the same database with clear provenance.
 
 Schema overview:
 
 ```sql
 -- Every event from every source
 CREATE TABLE events (
-    id           INTEGER PRIMARY KEY,
-    ts_mono_us   INTEGER NOT NULL,   -- microseconds since boot
-    ts_wall      TEXT    NOT NULL,   -- ISO8601 wall clock
-    source       TEXT    NOT NULL,   -- HCI|DBUS|DAEMON|KERNEL|SYSFS
-    severity     TEXT    NOT NULL,   -- INFO|WARN|ERROR|SUSPICIOUS
-    stage        TEXT,               -- DISCOVERY|CONNECTION|HANDSHAKE|DATA|AUDIO|TEARDOWN
-    device_addr  TEXT,               -- normalized BD address or null
-    event_type   TEXT    NOT NULL,   -- HCI_CMD|HCI_EVT|DBUS_PROP|DBUS_SIG|...
-    summary      TEXT    NOT NULL,   -- human-readable one-liner
-    raw_json     TEXT    NOT NULL    -- full parsed event data
+    id              INTEGER PRIMARY KEY,
+    schema_version  INTEGER NOT NULL DEFAULT 1,
+    source_version  TEXT,              -- e.g., "hci-collector-0.1.0"
+    parser_version  TEXT,              -- e.g., "hci-parser-0.1.0"
+    ts_mono_us      INTEGER NOT NULL,  -- microseconds since boot
+    ts_wall         TEXT    NOT NULL,  -- ISO8601 wall clock
+    source          TEXT    NOT NULL,  -- HCI|DBUS|DAEMON|KERNEL|SYSFS
+    severity        TEXT    NOT NULL,  -- INFO|WARN|ERROR|SUSPICIOUS
+    stage           TEXT,              -- DISCOVERY|CONNECTION|HANDSHAKE|DATA|AUDIO|TEARDOWN
+    device_addr     TEXT,              -- normalized BD address or null
+    event_type      TEXT    NOT NULL,  -- HCI_CMD|HCI_EVT|DBUS_PROP|DBUS_SIG|...
+    summary         TEXT    NOT NULL,  -- human-readable one-liner
+    raw_json        TEXT    NOT NULL,  -- full parsed event data
+    annotations     TEXT               -- freeform JSON dict for user-added metadata during triage
 );
+```
+
+The `annotations` field is a freeform JSON dictionary for tagging events during active debugging sessions — marking events of interest, adding notes, flagging events for follow-up, or any other metadata that wasn't anticipated at schema design time. It exists because in practice, during a real debugging session, you always need to mark things in ways the schema didn't predict. The field is nullable and ignored by the correlation engine; it's purely for human use.
+
+```sql
 
 -- Device identity across address changes
 CREATE TABLE devices (
@@ -804,9 +912,56 @@ CREATE TABLE sessions (
 
 **Retention policy** — events are lightweight (under 1KB each). 24 hours of active BT use produces 50–500K events, roughly 100MB uncompressed. SQLite with WAL mode handles this comfortably. Implement rolling cleanup: keep last N days or N GB, configurable.
 
+### Configuration (YAML with hot reload)
+
+bluTruth uses a YAML configuration file with live hot-reload. The runtime polls the config file for changes (1s interval; future: inotify/watchdog) and applies updates without requiring a restart. On config change, only affected collectors are restarted — the event bus, storage, and correlation engine continue uninterrupted.
+
+Default config location: `~/.blutruth/config.yaml`
+
+```yaml
+listen:
+  host: "127.0.0.1"         # local-only by default
+  port: 8484
+  # uds_path: "/tmp/blutruth.sock"  # optional Unix domain socket
+
+storage:
+  sqlite_path: "~/.blutruth/events.db"
+  jsonl_path: "~/.blutruth/events.jsonl"
+  retention_days: 30
+
+collectors:
+  hci:
+    enabled: true
+  dbus:
+    enabled: true
+  journalctl:
+    enabled: true
+    unit: "bluetooth"
+    format: "json"
+  kernel_trace:
+    enabled: false           # requires root + debugfs
+  advanced_bluetoothd:
+    enabled: false           # managed debug daemon, opt-in only
+    bluetoothd_path: "/usr/lib/bluetooth/bluetoothd"
+
+correlation:
+  time_window_ms: 100        # ±ms for cross-source event linking
+  rules_path: "~/.blutruth/rules/"  # YAML rule packs
+
+ui:
+  live_mode_default: true
+  fallback_refresh_seconds: 2
+  max_rows: 500
+
+security:
+  local_only: true
+```
+
+Config hot-reload enables operational flexibility: enable/disable collectors, adjust correlation windows, or toggle advanced mode without dropping an active capture session. The runtime emits a config-reload event to the timeline when changes are applied, providing an audit trail.
+
 ### Interface Layer
 
-#### TUI (Python Textual / Rust Ratatui)
+#### TUI (Python Textual)
 
 Extend existing `bttui.py`. New tabs needed:
 
@@ -820,25 +975,37 @@ Extend existing `bttui.py`. New tabs needed:
 
 **Anomaly Tab** — flagged events only. Pattern matches against known attack signatures and failure patterns.
 
-#### HTTP + Web UI
+#### HTTP + Web UI (progressive enhancement)
 
-A lightweight HTTP server embedded in the same process (or sidecar). Endpoints:
+A lightweight HTTP server embedded in the same process (or sidecar). Bind to `127.0.0.1` by default (local-only). Endpoints:
 
-`GET /events?since=<ts>&source=<>&device=<>` — event stream as JSON or SSE for real-time push.
+`GET /events?since=<ts>&source=<>&device=<>` — event query as JSON, or SSE stream for real-time push.
 `GET /state` — current adapter and device state snapshot.
 `GET /devices` — all known devices with current status.
 `POST /control` — management actions (restart, wipe, etc.).
-`GET /` — React SPA for browser access.
+`GET /stream` — SSE endpoint for live event streaming (used by Live Mode).
+`GET /` — server-rendered HTML UI.
+
+**Progressive enhancement strategy (no-JS baseline):**
+
+The web UI works without JavaScript. The baseline renders server-side HTML with query forms and event tables. Auto-refresh via `<meta http-equiv="refresh">` provides a no-JS live-ish experience.
+
+When JavaScript is available (default: enabled), a small inline script (~50-80 lines) activates Live Mode using Server-Sent Events (EventSource). Events stream in real-time and are prepended to the table without page reloads. If the browser blocks JS or SSE fails, the page falls back to refresh mode automatically via `<noscript>`.
+
+This means:
+- Zero-JS baseline: fully functional, refresh-based, always works
+- Live Mode (JS): SSE streaming, enabled by default, graceful degradation
+- No React, no build step, no node_modules — just server-rendered HTML with optional progressive enhancement
 
 The web UI is valuable for remote debugging over SSH with port forwarding, attaching a second screen without a terminal multiplexer, sharing a live session, and long-running capture monitoring.
 
 **Technology choice:**
 
-Python backend: `aiohttp` for HTTP server plus `dbus-python` for D-Bus. Minimal dependencies, fast iteration.
+Python implementation (primary): `aiohttp` or FastAPI for HTTP server, `dbus-next` (pure Python, no C extensions) for D-Bus, asyncio throughout for concurrent collection. Minimal dependencies, fast iteration, easy packaging.
 
-Rust backend: `axum` plus `zbus` for D-Bus. Single binary, faster, better for deployment.
+Rust port (future): `axum` plus `zbus` for D-Bus. Single binary, faster, better for deployment. The canonical event schema, SQLite database, JSONL format, and HTTP API contract are all designed to survive this transition unchanged.
 
-**Recommended approach:** Python for the collection and correlation engine during development (faster to iterate on the classification and correlation logic), Rust for the final production binary once the architecture is proven.
+**Recommended approach:** Python for the full implementation — collection, correlation, storage, HTTP API, and web UI. The architecture maintains clear module boundaries and data format contracts so that individual components can be ported to Rust incrementally without a rewrite. The database, JSONL files, and API responses produced by the Python version will be fully compatible with the Rust version.
 
 ---
 
@@ -1457,17 +1624,17 @@ These tools prove the concept. Phase 1 integrates them into a unified platform.
 
 1. **HCI broadcaster refactor** — current bttui.py runs btmon as a subprocess and parses its output. Refactor to a proper broadcaster class that parses HCI lines into structured dicts with fields: `ts_mono_us`, `direction` (TX/RX), `type` (CMD/EVT/ACL/SCO), `opcode_or_event`, `status`, `handle`, `payload_hex`, `summary_text`, `stage`, `severity`. Fan out to multiple consumers (TUI tab, SQLite writer, HTTP SSE stream, btsnoop file writer).
 
-2. **D-Bus monitor module** — new `dbus_monitor.py` using `dbus-python` (or `dbus-next` for async). Subscribes to all `PropertiesChanged`, `InterfacesAdded`, `InterfacesRemoved` on `org.bluez`. Emits events in the same normalized format. This is the core new feature of Phase 1.
+2. **D-Bus monitor module** — new `dbus_monitor.py` using `dbus-next` (pure Python, async-native, no C extensions). Subscribes to all `PropertiesChanged`, `InterfacesAdded`, `InterfacesRemoved` on `org.bluez`. Emits events in the same normalized format. This is the core new feature of Phase 1.
 
 3. **bluetoothd log capture** — subprocess launcher that optionally manages the daemon and captures stderr directly. Fallback to `journalctl -f -u bluetooth` for systems using systemd.
 
 4. **Kernel trace collector** — optional module (requires root + debugfs) that tails `/sys/kernel/debug/tracing/trace_pipe`. Lightweight filter: only emit events with `bluetooth` in the function name.
 
-5. **SQLite writer** — single-writer thread (important for SQLite performance) that drains a queue and inserts events. Uses WAL mode. Target: >1000 inserts/second sustained.
+5. **Dual storage writers** — JSONL append-only flight recorder (the "truth log" — portable, shareable, parseable with anything) plus SQLite single-writer with WAL mode draining a batched queue. Target: >1000 inserts/second sustained. Both receive every event.
 
-6. **Correlation pass** — runs asynchronously over recent events. Links HCI events to D-Bus events that occurred within ±100ms. Groups linked events under a shared `group_id`.
+6. **Correlation pass** — runs asynchronously over recent events. Links HCI events to D-Bus events that occurred within ±100ms (configurable via YAML). Groups linked events under a shared `group_id`. Correlation rules loaded from YAML rule packs.
 
-**Deliverable:** `blucollect.py` — a daemon that can run headless and write to `~/.blutruth.db`. The TUI and HTTP server connect to the database.
+**Deliverable:** `blucollect.py` — a Python daemon (asyncio) that can run headless and writes to `~/.blutruth/events.db` + `~/.blutruth/events.jsonl`. The TUI and HTTP server connect to the database. Architecture maintains clear module boundaries for future Rust port.
 
 ### Phase 2 — D-Bus Introspection Tab
 
@@ -1554,19 +1721,20 @@ Every operation captures a `bt_probe` snapshot before and after, allowing diff t
 - Search: grep-style across summaries
 - Zoom: expand any correlated group to see full event detail
 
-**HTTP + React SPA:**
+**HTTP + Web UI (progressive enhancement):**
 
 - `GET /stream` — SSE endpoint streaming normalized events as JSON
 - `GET /state` — current adapter/device state
 - `GET /events?since=&limit=&source=&device=` — historical query
 - `POST /control` — JSON body with action and parameters
-- React frontend with the same timeline view as the TUI, rendered in browser
+- Server-rendered HTML baseline (no JS required) with optional Live Mode via SSE
 - Shareable URLs for a specific time range
 - Export: download a time range as JSON or as a btsnoop file
 
 **Technology stack:**
-- Python `aiohttp` for HTTP server (integrates cleanly with the async D-Bus and btmon collection)
-- React + Vite for the SPA, served as static files from the same process
+- Python `aiohttp` or FastAPI for HTTP server (integrates cleanly with the async D-Bus and btmon collection)
+- Server-rendered HTML with progressive enhancement (SSE + ~80 lines inline JS for Live Mode)
+- No React, no build step — the UI is served from the same process with zero frontend dependencies
 - SSE (Server-Sent Events) for real-time push — simpler than WebSocket, sufficient for this use case
 
 ### Phase 5 — Anomaly Detection
@@ -1597,6 +1765,16 @@ Anomaly events appear in a dedicated tab and are flagged in the timeline with a 
 Areas of the stack where current tools have no or very limited visibility:
 
 **Controller internals** — the controller firmware is entirely opaque. You see only what it chooses to tell you via HCI events. Controller-side bugs, internal scheduling decisions, and RF-level failures are invisible unless the controller reports them as error events — which poorly implemented firmware often does not.
+
+**mgmt API / netlink channel** — `btmgmt` gives command-level access but there is no good passive monitor for the mgmt channel traffic between bluetoothd and the kernel. You can see effects upstream (D-Bus) or downstream (HCI) but the mgmt conversation itself is a blind spot. This is where adapter power-on sequencing, discovery filter configuration, and security policy decisions flow — all invisible in current tooling.
+
+**PipeWire/PulseAudio ↔ BlueZ profile handoff** — when A2DP or HFP codec negotiation happens, the profile plugin interactions are invisible. `pw-dump` and `pactl` show the result (a sink appeared) but not the negotiation path or failure reasons. This is where "audio works on one device but not another" mysteries live.
+
+**Kernel internals (bluetooth.ko)** — between the mgmt API and the HCI driver, the kernel's internal state machine is only observable via `ftrace`/`tracepoints` or reading `/sys/kernel/debug/bluetooth/`. Those interfaces are fragile, undocumented, and vary by kernel version.
+
+**btusb.ko / hci_uart.ko driver layer** — USB-level issues (firmware loading failures, USB autosuspend killing connections, URB errors) show up in `dmesg` but are not correlated with anything above them. This is where "adapter randomly disappears" problems originate.
+
+**Cross-layer correlation** — this is bluTruth's core thesis. Nobody connects "btusb firmware load → HCI reset → mgmt power-on → D-Bus adapter appeared → PipeWire sink created" into a single traceable timeline today.
 
 **SCO/eSCO audio path** — once an SCO connection is established, the audio data flows through a separate kernel path. You can see the connection setup in btmon but not the audio quality, jitter, or packet error rate on the SCO link unless the controller sends SCO link statistics events (rare in consumer hardware).
 
@@ -1743,4 +1921,4 @@ echo 0 > /sys/kernel/debug/tracing/events/bluetooth/enable
 
 *This document is the living knowledge base for the bluTruth project.*
 *Update this file as the architecture evolves and new diagnostic capabilities are added.*
-*Last updated: 2026-02-23*
+*Last updated: 2026-02-27*
