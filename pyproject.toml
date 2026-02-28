@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blutruth"
+version = "0.1.0"
+description = "Bluetooth Stack Diagnostic Platform — unified timeline correlation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Ryan"}]
+
+dependencies = [
+    "pyyaml>=6.0",
+    "dbus-next>=0.2.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[project.scripts]
+blutruth = "blutruth.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["blutruth*"]
