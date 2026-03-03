@@ -7,6 +7,20 @@ with severity classification, lifecycle stage mapping, and device context.
 The HCI monitor socket is an exclusive resource — only one consumer can
 own it at a time. This collector owns it and fans out via the event bus.
 
+btmon output format (v5.72, piped):
+  = New Index: 7C:10:C9:75:8D:37 (Primary,USB,hci0)         [hci0] 0.000001
+  < HCI Command: LE Set Scan Parameters (0x200b) plen 7      [hci0] 1.234567
+          Type: Passive (0x00)
+          ...
+  > HCI Event: LE Meta Event (0x3e) plen 12                  [hci0] 1.345678
+          LE Connection Complete (0x01)
+          ...
+  @ MGMT Event: Device Connected (0x000b) plen 37           {0x0001} [hci0]
+
+Direction markers: < (host->controller) > (controller->host) = (system) @ (mgmt)
+Some lines get btmon[PID]: prefix when piped.
+NOTE: -T flag causes buffer overflow crash on btmon 5.72 when piped.
+
 FUTURE: Parse btmon binary output (btsnoop) directly for richer data.
 FUTURE: Simultaneous btsnoop file writing for Wireshark export.
 FUTURE (Rust port): Open HCI_MONITOR socket directly via libc, no btmon subprocess.
@@ -27,7 +41,6 @@ from blutruth.events import Event
 
 # --- HCI event classification ---
 
-# Opcode/event → (severity, stage) mapping for common HCI traffic
 _HCI_CLASSIFICATION: Dict[str, tuple] = {
     # Commands
     "Inquiry":                          ("INFO",  "DISCOVERY"),
@@ -88,9 +101,30 @@ _HCI_CLASSIFICATION: Dict[str, tuple] = {
     "SMP: Pairing Failed":              ("ERROR", "HANDSHAKE"),
     "SMP: Encryption Information":      ("INFO",  "HANDSHAKE"),
     "SMP: Security Request":            ("INFO",  "HANDSHAKE"),
+
+    # MGMT events
+    "Device Connected":                 ("INFO",  "CONNECTION"),
+    "Device Disconnected":              ("WARN",  "TEARDOWN"),
+    "Connect Failed":                   ("ERROR", "CONNECTION"),
+    "New Link Key":                     ("INFO",  "HANDSHAKE"),
+    "New Long Term Key":                ("INFO",  "HANDSHAKE"),
+    "Device Found":                     ("DEBUG", "DISCOVERY"),
+    "Discovering":                      ("INFO",  "DISCOVERY"),
+    "Device Blocked":                   ("WARN",  "CONNECTION"),
+    "Device Unblocked":                 ("INFO",  "CONNECTION"),
+    "New IRK":                          ("INFO",  "HANDSHAKE"),
+    "New CSRK":                         ("INFO",  "HANDSHAKE"),
+    "New Settings":                     ("INFO",  None),
+    "Class Of Device Changed":          ("INFO",  "DISCOVERY"),
+
+    # Index events
+    "New Index":                        ("INFO",  None),
+    "Open Index":                       ("INFO",  None),
+    "Delete Index":                     ("WARN",  None),
+    "Close Index":                      ("WARN",  None),
 }
 
-# Error-indicating patterns in btmon output
+# Error-indicating patterns
 _ERROR_PATTERNS = [
     (re.compile(r"Status:\s+(0x[0-9a-f]{2})\s+\((\w.+?)\)", re.I), "ERROR"),
     (re.compile(r"Reason:\s+(0x[0-9a-f]{2})\s+\((\w.+?)\)", re.I), "WARN"),
@@ -100,21 +134,33 @@ _ERROR_PATTERNS = [
 # Device address extraction
 _ADDR_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
 
-# btmon header line: direction + event name
+# Adapter tag: [hci0]
+_ADAPTER_RE = re.compile(r"\[(hci\d+)\]")
+
+# btmon header line — all four direction markers
+# Handles optional btmon[PID]: prefix from piped output
 _HEADER_RE = re.compile(
-    r"^[<>@]\s+"                       # direction marker
-    r"(?:HCI\s+)?"
-    r"((?:Command|Event|ACL|SCO).*?)$"  # capture the event description
+    r"^(?:btmon\[\d+\]:\s*)?"          # optional btmon[PID]: prefix
+    r"([<>=@])\s+"                      # direction marker (captured)
+    r"(.+?)"                            # event description (captured)
+    r"\s+(?:\{0x[0-9a-f]+\}\s*)?"      # optional mgmt handle {0x0001}
+    r"\[hci\d+\]"                       # [hciN] adapter tag
 )
 
-# btmon timestamp line
-_TS_RE = re.compile(r"^#\s+\d+\.\d+$")
+# Continuation lines: indented content belonging to current block
+_CONTINUATION_RE = re.compile(r"^\s{2,}")
+
+# btmon info lines to skip
+_SKIP_RE = re.compile(
+    r"^(?:btmon\[\d+\]:\s*)?=\s+Note:|"
+    r"^Bluetooth monitor ver"
+)
 
 
 class HciCollector(Collector):
     name = "hci"
     description = "HCI event capture via btmon"
-    version = "0.1.0"
+    version = "0.2.0"
 
     def __init__(self, bus: EventBus, config: Config) -> None:
         super().__init__(bus, config)
@@ -123,7 +169,7 @@ class HciCollector(Collector):
 
     def capabilities(self) -> Dict[str, Any]:
         return {
-            "requires_root": False,  # btmon works without root on most systems
+            "requires_root": False,
             "requires_debugfs": False,
             "exclusive_resource": "hci_monitor_socket",
             "optional_root_benefits": [
@@ -138,8 +184,10 @@ class HciCollector(Collector):
             return
 
         try:
+            # NOTE: Do NOT use -T flag — causes buffer overflow crash
+            # in btmon 5.72 when stdout is piped.
             self._proc = await asyncio.create_subprocess_exec(
-                "btmon", "-T",  # -T for timestamps
+                "btmon",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -160,7 +208,7 @@ class HciCollector(Collector):
         await self.bus.publish(Event.new(
             source="HCI",
             event_type="COLLECTOR_START",
-            summary="HCI collector started (btmon)",
+            summary=f"HCI collector started (btmon PID {self._proc.pid})",
             raw_json={"pid": self._proc.pid},
             source_version=self.source_version_tag,
         ))
@@ -185,6 +233,7 @@ class HciCollector(Collector):
 
         current_block: list[str] = []
         current_header: Optional[str] = None
+        current_direction: Optional[str] = None
 
         while self._running:
             try:
@@ -192,7 +241,6 @@ class HciCollector(Collector):
             except Exception:
                 break
             if not raw_line:
-                # btmon exited
                 if self._running:
                     await self.bus.publish(Event.new(
                         source="HCI",
@@ -206,54 +254,72 @@ class HciCollector(Collector):
 
             line = raw_line.decode("utf-8", errors="replace").rstrip()
 
-            # Skip empty lines and timestamp-only lines
-            if not line or _TS_RE.match(line):
+            # Skip empty lines and info lines
+            if not line or _SKIP_RE.match(line):
                 continue
 
-            # Detect new event block (starts with direction marker)
+            # New event block?
             header_match = _HEADER_RE.match(line)
             if header_match:
                 # Flush previous block
                 if current_header and current_block:
-                    await self._emit_event(current_header, current_block)
-                current_header = header_match.group(1).strip()
+                    await self._emit_event(current_direction, current_header, current_block)
+                current_direction = header_match.group(1)
+                current_header = header_match.group(2).strip()
                 current_block = [line]
-            else:
+            elif _CONTINUATION_RE.match(line) and current_header:
                 # Continuation of current block
                 current_block.append(line)
+            else:
+                # Unrecognized — flush current block and emit standalone
+                if current_header and current_block:
+                    await self._emit_event(current_direction, current_header, current_block)
+                    current_header = None
+                    current_direction = None
+                    current_block = []
 
         # Flush last block
         if current_header and current_block:
-            await self._emit_event(current_header, current_block)
+            await self._emit_event(current_direction, current_header, current_block)
 
-    async def _emit_event(self, header: str, block: list[str]) -> None:
+    async def _emit_event(self, direction: Optional[str], header: str, block: list[str]) -> None:
         """Parse a complete btmon event block and publish."""
         full_text = "\n".join(block)
 
-        # Classify
         severity, stage = self._classify(header, full_text)
-        event_type = self._event_type(header)
+        event_type = self._event_type(direction, header)
 
-        # Extract device address
+        # Extract adapter
+        adapter = None
+        adapter_m = _ADAPTER_RE.search(block[0] if block else "")
+        if adapter_m:
+            adapter = adapter_m.group(1)
+
+        # Extract device address from body lines (skip adapter addr in header)
         device_addr = None
-        for line in block:
+        for line in block[1:]:  # skip header line
             m = _ADDR_RE.search(line)
             if m:
                 device_addr = m.group(1).upper()
                 break
+        # Fallback: check header for non-index events
+        if not device_addr and "Index" not in header:
+            m = _ADDR_RE.search(block[0] if block else "")
+            if m:
+                device_addr = m.group(1).upper()
 
-        # Check for error status codes — upgrade severity
+        # Check for error status codes
         for pattern, err_sev in _ERROR_PATTERNS:
             m = pattern.search(full_text)
             if m:
-                # Don't downgrade severity
                 from blutruth.events import SEVERITY_ORDER
                 if SEVERITY_ORDER.get(err_sev, 0) > SEVERITY_ORDER.get(severity, 0):
                     severity = err_sev
                 break
 
-        # Build summary
-        summary = header[:200]
+        # Direction arrow for summary
+        dir_label = {"<": "\u2192", ">": "\u2190", "=": "=", "@": "@"}.get(direction, "?")
+        summary = f"{dir_label} {header}"[:200]
 
         await self.bus.publish(Event.new(
             source="HCI",
@@ -261,8 +327,13 @@ class HciCollector(Collector):
             stage=stage,
             event_type=event_type,
             summary=summary,
-            raw_json={"header": header, "lines": block},
+            raw_json={
+                "direction": direction,
+                "header": header,
+                "lines": block,
+            },
             raw=full_text,
+            adapter=adapter,
             device_addr=device_addr,
             source_version=self.source_version_tag,
             parser_version=f"hci-parser-{self.version}",
@@ -273,17 +344,21 @@ class HciCollector(Collector):
         for key, (sev, stg) in _HCI_CLASSIFICATION.items():
             if key in header:
                 return (sev, stg)
-        # Fallback
         if "Error" in text or "Failed" in text:
             return ("ERROR", None)
         return ("INFO", None)
 
-    def _event_type(self, header: str) -> str:
-        """Map btmon header to event_type tag."""
+    def _event_type(self, direction: Optional[str], header: str) -> str:
+        """Map btmon direction + header to event_type tag."""
+        if direction == "=":
+            return "HCI_INDEX"
+        if direction == "@":
+            return "HCI_MGMT"
+
         h = header.lower()
-        if "command" in h and "complete" not in h and "status" not in h:
+        if "command:" in h and "complete" not in h and "status" not in h:
             return "HCI_CMD"
-        if "event" in h or "complete" in h or "status" in h:
+        if "event:" in h or "complete" in h or "status" in h:
             return "HCI_EVT"
         if "acl" in h:
             return "HCI_ACL"

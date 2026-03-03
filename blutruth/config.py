@@ -39,11 +39,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "unit": "bluetooth",
             "format": "json",
         },
+        "mgmt": {
+            "enabled": False,   # requires root
+            "sysfs_poll_s": 5.0,
+        },
+        "pipewire": {
+            "enabled": True,    # no root required
+        },
         "kernel_trace": {
-            "enabled": False,  # requires root + debugfs
+            "enabled": False,   # requires root + debugfs
+            "ftrace": False,    # opt-in: enables bluetooth tracepoints in tracefs
+            "module_poll_s": 10.0,
         },
         "advanced_bluetoothd": {
-            "enabled": False,  # managed debug daemon, opt-in only
+            "enabled": False,   # managed debug daemon, opt-in only
             "bluetoothd_path": "/usr/lib/bluetooth/bluetoothd",
         },
     },

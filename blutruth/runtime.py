@@ -16,7 +16,15 @@ from pathlib import Path
 from typing import List, Optional
 
 from blutruth.bus import EventBus
-from blutruth.collectors import Collector, HciCollector, DbusCollector, DaemonLogCollector
+from blutruth.collectors import (
+    Collector,
+    HciCollector,
+    DbusCollector,
+    DaemonLogCollector,
+    MgmtApiCollector,
+    PipewireCollector,
+    KernelDriverCollector,
+)
 from blutruth.config import Config
 from blutruth.correlation.engine import CorrelationEngine
 from blutruth.events import Event
@@ -79,6 +87,10 @@ class Runtime:
             DbusCollector(self.bus, self.config),
             DaemonLogCollector(self.bus, self.config),
         ]
+        # Optional collectors: only present if import succeeded and tool is available
+        for cls in (MgmtApiCollector, PipewireCollector, KernelDriverCollector):
+            if cls is not None:
+                self.collectors.append(cls(self.bus, self.config))
 
         # 5. Check capabilities and start enabled collectors
         for collector in self.collectors:

@@ -197,7 +197,10 @@ async def cmd_status(args: argparse.Namespace) -> None:
     print()
 
     # Check what collectors would be enabled
-    from blutruth.collectors import HciCollector, DbusCollector, DaemonLogCollector
+    from blutruth.collectors import (
+        HciCollector, DbusCollector, DaemonLogCollector,
+        MgmtApiCollector, PipewireCollector, KernelDriverCollector,
+    )
     from blutruth.bus import EventBus
     bus = EventBus()
     collectors = [
@@ -205,6 +208,9 @@ async def cmd_status(args: argparse.Namespace) -> None:
         DbusCollector(bus, config),
         DaemonLogCollector(bus, config),
     ]
+    for cls in (MgmtApiCollector, PipewireCollector, KernelDriverCollector):
+        if cls is not None:
+            collectors.append(cls(bus, config))
 
     print("Collectors:")
     for c in collectors:
@@ -232,6 +238,69 @@ async def cmd_status(args: argparse.Namespace) -> None:
     except ImportError:
         dbus_status = "✗ dbus-next not installed"
     print(f"D-Bus:      {dbus_status}")
+
+
+async def cmd_serve(args: argparse.Namespace) -> None:
+    """Start collection daemon + web UI."""
+    try:
+        from blutruth.web import start_web
+    except ImportError:
+        print("aiohttp required for web UI: uv pip install aiohttp", file=sys.stderr)
+        sys.exit(1)
+
+    runtime = Runtime(Path(args.config))
+    stop_event = asyncio.Event()
+
+    def handle_signal():
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, handle_signal)
+
+    await runtime.start()
+
+    host = args.host or runtime.config.get("listen", "host", default="127.0.0.1")
+    port = args.port or runtime.config.get("listen", "port", default=8484)
+
+    runner = await start_web(runtime, host=host, port=port)
+
+    print(f"bluTruth collecting → {runtime.sqlite.path}", file=sys.stderr)
+    print(f"                    → {runtime.jsonl.path}", file=sys.stderr)
+    print(f"", file=sys.stderr)
+    print(f"  Web UI: http://{host}:{port}", file=sys.stderr)
+    print(f"", file=sys.stderr)
+    print(f"Press Ctrl+C to stop.\n", file=sys.stderr)
+
+    # Also print events to terminal if verbose
+    if args.verbose:
+        queue = await runtime.bus.subscribe(max_queue=5000)
+        print_task = asyncio.create_task(_print_events(queue, verbose=True))
+    else:
+        queue = None
+        print_task = None
+
+    await stop_event.wait()
+
+    print("\nShutting down...", file=sys.stderr)
+
+    if print_task:
+        print_task.cancel()
+        try:
+            await print_task
+        except asyncio.CancelledError:
+            pass
+    if queue:
+        await runtime.bus.unsubscribe(queue)
+
+    await runner.cleanup()
+    await runtime.stop()
+
+    stats = runtime.stats
+    print(f"\nSession stats:", file=sys.stderr)
+    print(f"  Events written (SQLite): {stats['sqlite']['total_written']}", file=sys.stderr)
+    print(f"  Events written (JSONL):  {stats['jsonl']['total_written']}", file=sys.stderr)
+    print(f"  Correlation groups:      {stats['correlation']['total_groups_created']}", file=sys.stderr)
 
 
 async def cmd_devices(args: argparse.Namespace) -> None:
@@ -296,6 +365,12 @@ def build_parser() -> argparse.ArgumentParser:
     # status
     sub.add_parser("status", help="Show runtime status and prerequisites")
 
+    # serve
+    p_serve = sub.add_parser("serve", help="Start collection + web UI")
+    p_serve.add_argument("-v", "--verbose", action="store_true", help="Also print events to terminal")
+    p_serve.add_argument("--host", default=None, help="Bind address (default: from config)")
+    p_serve.add_argument("--port", type=int, default=None, help="Bind port (default: from config)")
+
     # devices
     sub.add_parser("devices", help="List known devices from database")
 
@@ -314,6 +389,7 @@ def main() -> None:
         "collect": cmd_collect,
         "tail": cmd_tail,
         "status": cmd_status,
+        "serve": cmd_serve,
         "devices": cmd_devices,
     }
 

@@ -26,8 +26,8 @@ dev = [
 [project.scripts]
 blutruth = "blutruth.cli:main"
 
-[tool.setuptools]
-include-package-data = true
-
 [tool.setuptools.packages.find]
 include = ["blutruth*"]
+
+[tool.setuptools]
+include-package-data = true
