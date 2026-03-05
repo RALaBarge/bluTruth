@@ -4,6 +4,20 @@ blutruth.config — YAML configuration with hot reload
 Config is polled for changes every 1s. On change, only affected collectors
 restart; the event bus, storage, and correlation engine continue uninterrupted.
 
+Fields that are PARSED but not yet implemented (reserved for future milestones):
+  storage.retention_days      — Tier 2: periodic DELETE of old events; DB grows forever today
+  correlation.rules_path      — Tier 3: YAML semantic rule-pack; only time-window grouping today
+
+Fields that are fully implemented:
+  listen.*                    — host/port for 'serve' command
+  storage.sqlite_path / jsonl_path
+  collectors.*                — per-collector enabled + options, hot-reloaded
+  correlation.time_window_ms / batch_interval_s
+  ui.max_rows                 — JS MAX_EVENTS cap in the live UI
+  ui.fallback_refresh_seconds — noscript meta-refresh interval
+  ui.live_mode_default        — whether SSE auto-connects on page load
+  security.local_only         — warns when binding non-loopback with local_only=true
+
 FUTURE: Replace polling with inotify/watchdog for efficiency.
 FUTURE (Rust port): serde_yaml with notify crate for file watching.
 """
@@ -54,6 +68,25 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "advanced_bluetoothd": {
             "enabled": False,   # managed debug daemon, opt-in only
             "bluetoothd_path": "/usr/lib/bluetooth/bluetoothd",
+        },
+        "sysfs": {
+            "enabled": True,    # no root, no deps — always on
+            "poll_s": 2.0,
+        },
+        "udev": {
+            "enabled": True,    # no root, no deps — always on
+        },
+        "ubertooth": {
+            "enabled": False,   # requires Ubertooth One hardware
+            "mock_data": False, # set True to emit synthetic events for testing
+        },
+        "ble_sniffer": {
+            "enabled": False,   # requires nRF Sniffer or btlejack hardware
+            "mock_data": False,
+        },
+        "ebpf": {
+            "enabled": False,   # requires root + CAP_BPF + bcc
+            "mock_data": False,
         },
     },
     "correlation": {

@@ -24,6 +24,11 @@ from blutruth.collectors import (
     MgmtApiCollector,
     PipewireCollector,
     KernelDriverCollector,
+    SysfsCollector,
+    UdevCollector,
+    UbertoothCollector,
+    BleSnifferCollector,
+    EbpfCollector,
 )
 from blutruth.config import Config
 from blutruth.correlation.engine import CorrelationEngine
@@ -46,16 +51,25 @@ class Runtime:
     - Event bus replaced with unix socket + framed JSON or gRPC
     """
 
-    def __init__(self, config_path: Path) -> None:
+    def __init__(
+        self,
+        config_path: Path,
+        force_disabled: Optional[set] = None,
+        session_name: Optional[str] = None,
+    ) -> None:
         self.config = Config(config_path)
         self.config.load()
+        self._force_disabled: set = force_disabled or set()
+        self._session_name: Optional[str] = session_name
 
         self.bus = EventBus()
 
+        retention_days = int(self.config.get("storage", "retention_days", default=0))
         self.sqlite = SqliteSink(
             Path(self.config.get("storage", "sqlite_path")),
             batch_size=100,
             flush_interval_s=0.25,
+            retention_days=retention_days,
         )
         self.jsonl = JsonlSink(
             Path(self.config.get("storage", "jsonl_path")),
@@ -67,6 +81,7 @@ class Runtime:
         self._writer_task: Optional[asyncio.Task] = None
         self._config_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
+        self._session_id: Optional[int] = None
 
     async def start(self) -> None:
         """Start all components in dependency order."""
@@ -74,26 +89,52 @@ class Runtime:
         await self.sqlite.start()
         await self.jsonl.start()
 
-        # 2. Writer task (drains bus → storage)
+        # 2. Session — create before events start flowing so all events get stamped
+        import datetime as _dt
+        session_name = self._session_name or (
+            f"collect {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()}"
+        )
+        self._session_id = await self.sqlite.create_session(session_name)
+
+        # 3. Writer task (drains bus → storage)
         self._writer_task = asyncio.create_task(self._writer_loop())
 
-        # 3. Privilege check
+        # 5. Privilege check
         await self._check_privileges()
 
-        # 4. Register collectors
+        # 6. Register collectors
         # FUTURE: Dynamic plugin discovery from a directory / entrypoints
         self.collectors = [
             HciCollector(self.bus, self.config),
             DbusCollector(self.bus, self.config),
             DaemonLogCollector(self.bus, self.config),
         ]
-        # Optional collectors: only present if import succeeded and tool is available
-        for cls in (MgmtApiCollector, PipewireCollector, KernelDriverCollector):
+        # Optional collectors — gracefully absent if import/tool unavailable
+        _optional = (
+            MgmtApiCollector,
+            PipewireCollector,
+            KernelDriverCollector,
+            SysfsCollector,
+            UdevCollector,
+            UbertoothCollector,
+            BleSnifferCollector,
+            EbpfCollector,
+        )
+        for cls in _optional:
             if cls is not None:
                 self.collectors.append(cls(self.bus, self.config))
 
-        # 5. Check capabilities and start enabled collectors
+        # 7. Check capabilities and start enabled collectors
         for collector in self.collectors:
+            if collector.name in self._force_disabled:
+                await self.bus.publish(Event.new(
+                    source="RUNTIME",
+                    severity="INFO",
+                    event_type="COLLECTOR_SKIP",
+                    summary=f"Collector '{collector.name}' disabled via CLI flag",
+                    raw_json={"collector": collector.name},
+                ))
+                continue
             if not collector.enabled():
                 await self.bus.publish(Event.new(
                     source="RUNTIME",
@@ -129,10 +170,10 @@ class Runtime:
                     raw_json={"collector": collector.name, "error": str(e)},
                 ))
 
-        # 6. Correlation engine
+        # 8. Correlation engine
         await self.correlation.start()
 
-        # 7. Config hot reload watcher
+        # 9. Config hot reload watcher
         self._config_task = asyncio.create_task(self._config_watch_loop())
 
         await self.bus.publish(Event.new(
@@ -140,6 +181,8 @@ class Runtime:
             event_type="RUNTIME_START",
             summary="bluTruth runtime started",
             raw_json={
+                "session_id": self._session_id,
+                "session_name": session_name,
                 "collectors_active": [
                     c.name for c in self.collectors if c.is_running
                 ],
@@ -185,6 +228,10 @@ class Runtime:
             except asyncio.CancelledError:
                 pass
 
+        # Close session before storage flushes the final events
+        if self._session_id:
+            await self.sqlite.end_session(self._session_id)
+
         # Storage (flush remaining)
         await self.sqlite.stop()
         await self.jsonl.stop()
@@ -215,51 +262,68 @@ class Runtime:
 
     async def _config_watch_loop(self) -> None:
         """
-        Poll config file for changes and restart affected collectors.
+        Watch config file for changes and restart affected collectors.
 
-        FUTURE: Replace with inotify/watchdog for efficiency.
+        Uses watchfiles (inotify/kqueue/FSEvents) when available, falls back to
+        1-second polling. Either way, config.load() mtime-guards against
+        unnecessary reloads.
+
         FUTURE: Compute diffs and only restart affected collectors.
         """
+        try:
+            from watchfiles import awatch as _awatch
+            async for _ in _awatch(str(self.config.path), stop_event=self._stop_event):
+                if not self.config.load():
+                    continue
+                await self._on_config_changed()
+        except ImportError:
+            pass  # fall through to polling
+        except Exception:
+            pass  # watchfiles failed (e.g., path doesn't exist yet) — fall through
+
+        # Polling fallback
         while not self._stop_event.is_set():
             await asyncio.sleep(1.0)
-
             if not self.config.load():
                 continue
+            await self._on_config_changed()
 
+    async def _on_config_changed(self) -> None:
+        """Handle a detected config change."""
+        await self.bus.publish(Event.new(
+            source="RUNTIME",
+            event_type="CONFIG_RELOAD",
+            summary="Configuration reloaded",
+            raw_json={"config_path": str(self.config.path)},
+            tags=["config"],
+        ))
+
+        # If collector config changed, restart them
+        if self.config.collectors_changed():
             await self.bus.publish(Event.new(
                 source="RUNTIME",
                 event_type="CONFIG_RELOAD",
-                summary="Configuration reloaded",
-                raw_json={"config_path": str(self.config.path)},
+                summary="Collector configuration changed — restarting collectors",
+                raw_json={},
                 tags=["config"],
             ))
-
-            # If collector config changed, restart them
-            if self.config.collectors_changed():
-                await self.bus.publish(Event.new(
-                    source="RUNTIME",
-                    event_type="CONFIG_RELOAD",
-                    summary="Collector configuration changed — restarting collectors",
-                    raw_json={},
-                    tags=["config"],
-                ))
-                for collector in self.collectors:
+            for collector in self.collectors:
+                try:
+                    await collector.stop()
+                except Exception:
+                    pass
+            for collector in self.collectors:
+                if collector.enabled():
                     try:
-                        await collector.stop()
-                    except Exception:
-                        pass
-                for collector in self.collectors:
-                    if collector.enabled():
-                        try:
-                            await collector.start()
-                        except Exception as e:
-                            await self.bus.publish(Event.new(
-                                source="RUNTIME",
-                                severity="ERROR",
-                                event_type="COLLECTOR_ERROR",
-                                summary=f"Failed to restart '{collector.name}': {e}",
-                                raw_json={"collector": collector.name, "error": str(e)},
-                            ))
+                        await collector.start()
+                    except Exception as e:
+                        await self.bus.publish(Event.new(
+                            source="RUNTIME",
+                            severity="ERROR",
+                            event_type="COLLECTOR_ERROR",
+                            summary=f"Failed to restart '{collector.name}': {e}",
+                            raw_json={"collector": collector.name, "error": str(e)},
+                        ))
 
     async def _check_privileges(self) -> None:
         """Emit a notice about privilege level and what's available."""
@@ -280,6 +344,7 @@ class Runtime:
     @property
     def stats(self) -> dict:
         return {
+            "session_id": self._session_id,
             "bus": self.bus.stats,
             "sqlite": self.sqlite.stats,
             "jsonl": self.jsonl.stats,

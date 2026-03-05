@@ -9,6 +9,7 @@ This directory is for the big-picture thinking: architecture decisions, design p
 | `architecture.md` | Overall architecture, every major design decision with the "why", current build state, planned phases |
 | `hci_event_taxonomy.md` | Complete breakdown of HCI event types — direction markers, event classification, lifecycle stages, btmon quirks |
 | `collector_design.md` | The Collector ABC, capabilities() contract, subprocess pattern, per-collector implementation notes |
+| `changelog.md` | Running log of design-level changes — what changed, why, and what was explicitly left out |
 
 ## What Belongs Here
 

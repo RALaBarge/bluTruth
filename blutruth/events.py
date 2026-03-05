@@ -71,6 +71,36 @@ class Event:
         return int(time.monotonic() * 1_000_000)
 
     @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "Event":
+        """Reconstruct an Event from a stored dict (JSONL replay, export round-trip).
+
+        Preserves original timestamps and device context.
+        group_id is reset to None so events get re-correlated in the new session.
+        event_id is regenerated to avoid duplicate key issues.
+        """
+        return cls(
+            schema_version=d.get("schema_version", SCHEMA_VERSION),
+            source_version=d.get("source_version"),
+            parser_version=d.get("parser_version"),
+            event_id=uuid.uuid4().hex[:16],
+            ts_mono_us=d.get("ts_mono_us", cls._boot_us()),
+            ts_wall=d.get("ts_wall", dt.datetime.now(dt.timezone.utc).isoformat()),
+            source=d.get("source", "RUNTIME"),
+            severity=d.get("severity", "INFO"),
+            stage=d.get("stage"),
+            event_type=d.get("event_type", "GENERIC"),
+            adapter=d.get("adapter"),
+            device_addr=d.get("device_addr"),
+            device_name=d.get("device_name"),
+            summary=d.get("summary", ""),
+            raw_json=d.get("raw_json") or {},
+            raw=d.get("raw"),
+            group_id=None,
+            tags=d.get("tags"),
+            annotations=d.get("annotations"),
+        )
+
+    @classmethod
     def new(
         cls,
         *,
@@ -121,4 +151,4 @@ STAGES = ("DISCOVERY", "CONNECTION", "HANDSHAKE", "DATA", "AUDIO", "TEARDOWN")
 
 # --- Source constants ---
 
-SOURCES = ("HCI", "DBUS", "DAEMON", "KERNEL", "SYSFS", "RUNTIME")
+SOURCES = ("HCI", "DBUS", "DAEMON", "KERNEL", "SYSFS", "UDEV", "UBERTOOTH", "BLE_AIR", "EBPF_KERNEL", "RUNTIME")

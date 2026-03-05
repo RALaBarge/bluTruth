@@ -15,6 +15,7 @@ dependencies = [
     "pyyaml>=6.0",
     "dbus-next>=0.2.3",
     "aiohttp>=3.9",
+    "watchfiles>=0.21",
 ]
 
 [project.optional-dependencies]
