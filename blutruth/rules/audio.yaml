@@ -1,0 +1,97 @@
+# blutruth/rules/audio.yaml — Audio pipeline pattern rules
+#
+# Patterns that indicate audio quality or codec issues.
+# Correlates HCI, D-Bus, and PipeWire events.
+
+rules:
+
+  - id: a2dp_codec_fallback
+    name: "A2DP Codec Fallback"
+    description: >
+      Device negotiated one codec (e.g., aptX/LDAC) during pairing but is now
+      using SBC. Indicates codec negotiation failure or compatibility fallback.
+      Common cause of unexpected audio quality drop.
+    triggers:
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          key: Codec
+    time_window_ms: 2000
+    same_device: true
+    severity: WARN
+    summary: "A2DP codec change on {device_addr} — possible quality fallback"
+    action: >
+      Check which codec is now active. If downgraded to SBC, investigate
+      aptX/LDAC driver support. May indicate RF degradation forcing simpler codec.
+
+  - id: sco_connection_fail
+    name: "SCO/HFP Connection Failure"
+    description: >
+      SCO (voice call / HFP) connection failed. Seen as HCI error on SCO setup
+      followed by D-Bus disconnect on the HFP profile. Results in call audio
+      dropping or voice assistant failure.
+    triggers:
+      - source: HCI
+        event_type: DISCONNECT
+        conditions:
+          stage: SCO
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          key: Connected
+          value: false
+    time_window_ms: 1000
+    same_device: true
+    severity: ERROR
+    summary: "SCO/HFP disconnect on {device_addr}"
+    action: >
+      Check whether other ACL connections are active (SCO requires free slots).
+      Verify microphone/headset profile is accepted. Check for codec negotiation
+      issues (CVSD vs mSBC).
+
+  - id: audio_glitch_rtt_spike
+    name: "Audio Glitch with RTT Spike"
+    description: >
+      L2CAP RTT spike observed alongside an audio pipeline event. High RTT
+      during audio playback indicates RF degradation is the likely cause of
+      audio glitches rather than a software issue.
+    triggers:
+      - source: SYSFS
+        event_type: L2PING_RTT
+        conditions:
+          rtt_avg_ms: 50  # approximate — will match if > threshold too
+      - source: DAEMON
+        event_type: DAEMON_LOG
+    time_window_ms: 5000
+    same_device: true
+    severity: WARN
+    summary: "RF latency spike near audio event on {device_addr} — RF likely cause"
+    action: >
+      RF degradation suspected. Move device closer, check for 2.4GHz
+      interference (WiFi ch1/6/11, microwave). Consider switching WiFi to 5GHz.
+
+  - id: a2dp_suspend_resume_flood
+    name: "A2DP Suspend/Resume Flood"
+    description: >
+      Rapid A2DP transport state changes (active→idle→active) without user
+      action. Indicates buffer underruns, PipeWire scheduling issues, or
+      device power management aggressively suspending the BT link.
+    triggers:
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          interface: org.bluez.MediaTransport1
+          key: State
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          interface: org.bluez.MediaTransport1
+          key: State
+    time_window_ms: 2000
+    same_device: true
+    severity: WARN
+    summary: "Rapid A2DP state changes on {device_addr} — possible buffer underrun"
+    action: >
+      Check PipeWire/PulseAudio buffer settings. Increase quantum size.
+      Check if device's power management is too aggressive.
+      Monitor with `pw-top` during playback.

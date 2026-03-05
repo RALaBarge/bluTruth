@@ -16,6 +16,8 @@ Collectors (by stack layer, top to bottom):
   DbusCollector         — org.bluez D-Bus signal monitor
   DaemonLogCollector    — bluetoothd log capture (journalctl / managed mode)
   PipewireCollector     — Audio pipeline monitor (pw-dump / pactl fallback)
+  L2pingCollector       — Active L2CAP RTT monitor via l2ping
+  BatteryCollector      — GATT Battery Service via org.bluez.Battery1
 """
 
 from __future__ import annotations
@@ -34,6 +36,8 @@ UdevCollector         = None
 UbertoothCollector    = None
 BleSnifferCollector   = None
 EbpfCollector         = None
+L2pingCollector       = None
+BatteryCollector      = None
 
 try:
     from .mgmt_api import MgmtApiCollector          # type: ignore[assignment]
@@ -75,6 +79,16 @@ try:
 except Exception:
     pass
 
+try:
+    from .l2ping import L2pingCollector             # type: ignore[assignment]
+except Exception:
+    pass
+
+try:
+    from .battery import BatteryCollector           # type: ignore[assignment]
+except Exception:
+    pass
+
 __all__ = [
     "Collector",
     "HciCollector",
@@ -88,4 +102,6 @@ __all__ = [
     "UbertoothCollector",
     "BleSnifferCollector",
     "EbpfCollector",
+    "L2pingCollector",
+    "BatteryCollector",
 ]

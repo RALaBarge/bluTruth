@@ -99,6 +99,8 @@ def _force_disabled_from_args(args: argparse.Namespace) -> set:
         ("no_ubertooth",  "ubertooth"),
         ("no_ble_sniffer","ble_sniffer"),
         ("no_ebpf",       "ebpf"),
+        ("no_l2ping",     "l2ping"),
+        ("no_battery",    "battery"),
     ]
     return {name for flag, name in mapping if getattr(args, flag, False)}
 
@@ -546,6 +548,54 @@ async def cmd_replay(args: argparse.Namespace) -> None:
     print(f"Replay complete. {total} events written.", file=sys.stderr)
 
 
+async def cmd_history(args: argparse.Namespace) -> None:
+    """Show per-device session history with disconnect analysis."""
+    from blutruth.analysis.history import query_device_history, format_history
+
+    config = Config(Path(args.config))
+    config.load()
+    db_path = Path(config.get("storage", "sqlite_path"))
+
+    if not db_path.exists():
+        print(f"No database found at {db_path}. Run 'blutruth collect' first.", file=sys.stderr)
+        return
+
+    history = await query_device_history(
+        db_path,
+        args.device,
+        num_sessions=args.sessions,
+    )
+
+    if args.json:
+        out = {
+            "device_addr": history.device_addr,
+            "device_name": history.device_name,
+            "manufacturer": history.manufacturer,
+            "total_disconnects": history.total_disconnects,
+            "avg_disconnects_per_session": history.avg_disconnects_per_session,
+            "top_disconnect_reasons": history.top_disconnect_reasons,
+            "sessions": [
+                {
+                    "session_id": s.session_id,
+                    "session_name": s.session_name,
+                    "first_seen": s.first_seen,
+                    "last_seen": s.last_seen,
+                    "duration_minutes": s.duration_minutes,
+                    "event_count": s.event_count,
+                    "disconnect_count": s.disconnect_count,
+                    "disconnect_reasons": s.disconnect_reasons,
+                    "severity_counts": s.severity_counts,
+                }
+                for s in history.sessions
+            ],
+        }
+        import json as _json
+        print(_json.dumps(out, ensure_ascii=False, default=str))
+        return
+
+    print(format_history(history))
+
+
 async def cmd_export(args: argparse.Namespace) -> None:
     """Export stored events to JSONL or CSV."""
     import csv as _csv
@@ -671,6 +721,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_replay.add_argument("--session", default=None, metavar="NAME",
                           help="Name for the replay session (default: filename)")
 
+    # history
+    p_history = sub.add_parser("history", help="Show device session history and disconnect analysis")
+    p_history.add_argument("device", metavar="ADDR", help="Device Bluetooth address (e.g. AA:BB:CC:DD:EE:FF)")
+    p_history.add_argument("-n", "--sessions", type=int, default=5,
+                           help="Number of recent sessions to show (default: 5)")
+    p_history.add_argument("--json", action="store_true", help="Output as JSON")
+
     # export
     p_export = sub.add_parser("export", help="Export events to JSONL or CSV")
     p_export.add_argument("--format", default="jsonl", choices=["jsonl", "csv"],
@@ -705,6 +762,7 @@ def main() -> None:
         "sessions": cmd_sessions,
         "devices": cmd_devices,
         "replay": cmd_replay,
+        "history": cmd_history,
         "export": cmd_export,
     }
 

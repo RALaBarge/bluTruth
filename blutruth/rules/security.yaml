@@ -1,0 +1,149 @@
+# blutruth/rules/security.yaml — Security anomaly detection rules
+#
+# Patterns that may indicate security attacks or unexpected security events.
+# Severity SUSPICIOUS is used for patterns that are anomalous but not
+# definitively malicious — they warrant investigation.
+#
+# Implemented as pattern rules rather than a separate collector because
+# security events are just patterns on the same event stream.
+
+rules:
+
+  - id: unexpected_just_works_pairing
+    name: "Unexpected Just Works Pairing"
+    description: >
+      A pairing request was accepted via Just Works (no PIN, no numeric
+      comparison) from a device not previously seen. Just Works provides
+      no man-in-the-middle protection. In environments where you control
+      all BT devices, any new Just Works pairing is anomalous.
+    triggers:
+      - source: HCI
+        event_type: PAIR_REQUEST
+        conditions:
+          method: just_works
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          key: Paired
+          value: true
+    time_window_ms: 30000
+    same_device: true
+    severity: SUSPICIOUS
+    summary: "Just Works pairing completed with {device_addr} — no MITM protection"
+    action: >
+      Verify this pairing was intentional. Just Works has no MITM protection.
+      If unexpected, remove the pairing immediately: bluetoothctl remove <addr>.
+      Consider enabling SSP Numeric Comparison for all devices.
+
+  - id: auth_failure_unknown_device
+    name: "Authentication Failure from Unknown Device"
+    description: >
+      Authentication failure from a device with no prior connection history.
+      Could indicate a device attempting to use a guessed or default link key.
+    triggers:
+      - source: HCI
+        event_type: AUTH_FAILURE
+    time_window_ms: 100
+    same_device: true
+    severity: SUSPICIOUS
+    summary: "Auth failure from unknown device {device_addr}"
+    action: >
+      Investigate device identity. Check OUI manufacturer.
+      If device is not yours, consider blocking it.
+
+  - id: scan_flood
+    name: "BLE Advertising Scan Flood"
+    description: >
+      Same device address appearing in LE Advertising Reports repeatedly
+      (20+ times) without establishing a connection. May indicate a device
+      running continuous proximity scanning or an advertising-based attack.
+    triggers:
+      - source: HCI
+        event_type: LE_ADV_REPORT
+      - source: HCI
+        event_type: LE_ADV_REPORT
+      - source: HCI
+        event_type: LE_ADV_REPORT
+      - source: HCI
+        event_type: LE_ADV_REPORT
+      - source: HCI
+        event_type: LE_ADV_REPORT
+    time_window_ms: 10000
+    same_device: true
+    severity: SUSPICIOUS
+    summary: "Advertising flood from {device_addr} — high-frequency BLE advertising"
+    action: >
+      High-frequency advertising can indicate proximity tracking beacons,
+      continuous scanning tools, or advertising-based fingerprinting.
+      Check OUI of the advertiser. Random/resolvable addresses are less
+      concerning than static addresses.
+
+  - id: bias_indicator
+    name: "BIAS Attack Indicator"
+    description: >
+      Authentication was requested but no encryption change followed within
+      the expected window. This pattern matches one indicator of the BIAS
+      (Bluetooth Impersonation AttackS) attack — where an attacker completes
+      authentication without establishing encryption.
+      Note: This is a weak indicator; confirm with full HCI trace before acting.
+    triggers:
+      - source: HCI
+        event_type: AUTH_COMPLETE
+      - source: HCI
+        event_type: ENCRYPT_CHANGE
+    time_window_ms: 2000
+    same_device: true
+    severity: SUSPICIOUS
+    summary: "Auth without encryption on {device_addr} — possible BIAS indicator"
+    action: >
+      Confirm with full HCI trace (btmon). If auth completes but encryption
+      never starts, this may indicate a BIAS attack. Force disconnect and
+      remove the pairing. File a bug if reproducible with a known-good device.
+      Reference: CVE-2020-10135
+
+  - id: device_impersonation
+    name: "Possible Device Impersonation"
+    description: >
+      Two different Bluetooth addresses advertising the same device name
+      within a short time window. Could indicate a spoofing attack where
+      an attacker clones a device's advertised name to intercept connections.
+      False positive possible if you own two devices with the same name.
+    triggers:
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          key: Name
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          key: Name
+    time_window_ms: 5000
+    same_device: false
+    severity: SUSPICIOUS
+    summary: "Same device name from different addresses — possible impersonation"
+    action: >
+      Check if you own two devices with identical names. If not, one may be
+      spoofing the other's identity. Check OUI of both addresses.
+      Do not connect to the unknown address.
+
+  - id: mic_failure_disconnect
+    name: "MIC Failure Disconnect"
+    description: >
+      Connection terminated due to Message Integrity Check failure (0x3D).
+      The encrypted link's authentication tag failed verification. This can
+      indicate key compromise, a man-in-the-middle attack, or a serious
+      firmware bug. Should be investigated if not immediately explainable.
+    triggers:
+      - source: HCI
+        event_type: DISCONNECT
+        conditions:
+          reason_name: CONNECTION_TERMINATED_MIC_FAILURE
+    time_window_ms: 100
+    same_device: true
+    severity: ERROR
+    summary: "MIC failure disconnect on {device_addr} — possible key compromise or MITM"
+    action: >
+      Re-pair the device immediately (link key may be compromised).
+      If recurring with the same device, investigate for MITM attack.
+      Check if any other devices disconnected around the same time
+      (could indicate relay attack). Reference: CVE-2020-26555 (KNOB related).

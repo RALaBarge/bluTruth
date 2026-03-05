@@ -88,6 +88,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "enabled": False,   # requires root + CAP_BPF + bcc
             "mock_data": False,
         },
+        "l2ping": {
+            "enabled": True,    # no root — active RTT measurement
+            "poll_interval_s": 30,
+            "ping_count": 5,
+            "ping_timeout_s": 2,
+            "rtt_warn_ms": 50,
+            "rtt_error_ms": 150,
+        },
+        "battery": {
+            "enabled": True,    # no root — polls org.bluez.Battery1 via D-Bus
+            "poll_interval_s": 60,
+            "low_battery_warn": 20,
+            "low_battery_error": 10,
+        },
     },
     "correlation": {
         "time_window_ms": 100,

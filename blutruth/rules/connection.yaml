@@ -1,0 +1,142 @@
+# blutruth/rules/connection.yaml — Connection lifecycle pattern rules
+#
+# Patterns that indicate connection quality, reliability, or management issues.
+
+rules:
+
+  - id: auth_loop
+    name: "Authentication Failure Loop"
+    description: >
+      3+ authentication failures for the same device within a short window.
+      Indicates a persistent pairing/key mismatch. The connection will never
+      succeed until re-paired. Distinct from a single transient failure.
+    triggers:
+      - source: HCI
+        event_type: AUTH_FAILURE
+      - source: HCI
+        event_type: AUTH_FAILURE
+      - source: HCI
+        event_type: AUTH_FAILURE
+    time_window_ms: 5000
+    same_device: true
+    severity: ERROR
+    summary: "Auth failure loop on {device_addr} — pairing likely broken"
+    action: >
+      Remove pairing on both devices and re-pair. Check if device storage
+      was wiped (factory reset). On Linux: remove /var/lib/bluetooth/<adapter>/<device>
+      then `bluetoothctl remove <addr>`.
+
+  - id: silent_reconnect
+    name: "Silent Reconnect Pattern"
+    description: >
+      Device disconnected without sending a proper disconnect reason (HCI timeout
+      rather than REMOTE_USER_TERMINATED or LOCAL_HOST_TERMINATED) then reconnected
+      within 30 seconds. Indicates RF dropout rather than intentional disconnect.
+    triggers:
+      - source: HCI
+        event_type: DISCONNECT
+        conditions:
+          reason_name: CONNECTION_TIMEOUT
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          key: Connected
+          value: true
+    time_window_ms: 30000
+    same_device: true
+    severity: WARN
+    summary: "Silent reconnect on {device_addr} — RF dropout suspected"
+    action: >
+      RF dropout detected (device went out of range or had interference, then
+      came back). If recurring, check RF environment and device proximity.
+
+  - id: reconnect_flood
+    name: "Reconnect Flood"
+    description: >
+      Device connecting and disconnecting rapidly 3+ times. Can cause
+      bluetoothd to become unresponsive. May indicate device firmware bug,
+      low battery causing power cycling, or aggressive auto-reconnect logic.
+    triggers:
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          key: Connected
+          value: true
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          key: Connected
+          value: false
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          key: Connected
+          value: true
+    time_window_ms: 10000
+    same_device: true
+    severity: ERROR
+    summary: "Reconnect flood from {device_addr} — possible firmware or battery issue"
+    action: >
+      Check device battery level. Some devices with very low battery cycle power
+      rapidly. Check device firmware for known reconnect loop bugs.
+      Consider blocklisting if device is unknown.
+
+  - id: hci_disconnect_plus_dbus
+    name: "HCI + D-Bus Disconnect Correlation"
+    description: >
+      HCI Disconnection Complete event followed quickly by D-Bus Connected:false
+      for the same device. This is the standard correlation pattern confirming
+      a clean disconnect visible at both the HCI and application layers.
+    triggers:
+      - source: HCI
+        event_type: DISCONNECT
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          key: Connected
+          value: false
+    time_window_ms: 500
+    same_device: true
+    severity: INFO
+    summary: "Confirmed disconnect on {device_addr} (HCI + D-Bus correlated)"
+    action: >
+      Normal disconnect. Examine the disconnect reason code in the HCI event
+      for root cause (timeout vs local host vs remote user terminated).
+
+  - id: page_timeout_on_connect
+    name: "Page Timeout on Connection Attempt"
+    description: >
+      HCI_Create_Connection returned PAGE_TIMEOUT. Device did not respond to
+      page within the controller's page timeout period. Device may be off,
+      out of range, or in non-discoverable mode.
+    triggers:
+      - source: HCI
+        event_type: CONNECT_FAILED
+        conditions:
+          reason_name: PAGE_TIMEOUT
+    time_window_ms: 100
+    same_device: true
+    severity: WARN
+    summary: "Page timeout connecting to {device_addr} — device may be off or out of range"
+    action: >
+      Ensure device is powered on and discoverable. Move device closer.
+      Check if device has been factory-reset (will need re-pairing).
+
+  - id: lmp_timeout_disconnect
+    name: "LMP Timeout Disconnect"
+    description: >
+      LMP_RESPONSE_TIMEOUT (0x22) disconnect. Remote device stopped responding
+      at the link management protocol level. More serious than CONNECTION_TIMEOUT —
+      indicates firmware hang or severe RF degradation during an active connection.
+    triggers:
+      - source: HCI
+        event_type: DISCONNECT
+        conditions:
+          reason_name: LMP_RESPONSE_TIMEOUT
+    time_window_ms: 100
+    same_device: true
+    severity: ERROR
+    summary: "LMP timeout on {device_addr} — firmware hang or severe RF issue"
+    action: >
+      Power cycle the remote device (firmware may have hung). Check RF environment.
+      If persistent, check for firmware updates for the remote device.

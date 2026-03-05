@@ -29,9 +29,12 @@ from blutruth.collectors import (
     UbertoothCollector,
     BleSnifferCollector,
     EbpfCollector,
+    L2pingCollector,
+    BatteryCollector,
 )
 from blutruth.config import Config
 from blutruth.correlation.engine import CorrelationEngine
+from blutruth.correlation.rules import RuleEngine, load_rule_paths
 from blutruth.events import Event
 from blutruth.storage.jsonl import JsonlSink
 from blutruth.storage.sqlite import SqliteSink
@@ -76,6 +79,7 @@ class Runtime:
         )
 
         self.correlation = CorrelationEngine(self.bus, self.config, self.sqlite)
+        self.rules = RuleEngine(self.bus, self.config)
         self.collectors: List[Collector] = []
 
         self._writer_task: Optional[asyncio.Task] = None
@@ -119,6 +123,8 @@ class Runtime:
             UbertoothCollector,
             BleSnifferCollector,
             EbpfCollector,
+            L2pingCollector,
+            BatteryCollector,
         )
         for cls in _optional:
             if cls is not None:
@@ -170,8 +176,19 @@ class Runtime:
                     raw_json={"collector": collector.name, "error": str(e)},
                 ))
 
-        # 8. Correlation engine
+        # 8. Correlation engine + pattern rules
         await self.correlation.start()
+
+        rule_paths = load_rule_paths(self.config)
+        n_rules = self.rules.load_rules(rule_paths)
+        if n_rules > 0:
+            await self.rules.start()
+            await self.bus.publish(Event.new(
+                source="RUNTIME",
+                event_type="RULES_LOADED",
+                summary=f"Pattern rule engine started: {n_rules} rules from {len(rule_paths)} files",
+                raw_json={"rules": n_rules, "rule_files": [str(p) for p in rule_paths]},
+            ))
 
         # 9. Config hot reload watcher
         self._config_task = asyncio.create_task(self._config_watch_loop())
@@ -209,6 +226,9 @@ class Runtime:
                 await self._config_task
             except asyncio.CancelledError:
                 pass
+
+        # Pattern rules
+        await self.rules.stop()
 
         # Correlation
         await self.correlation.stop()
@@ -349,6 +369,7 @@ class Runtime:
             "sqlite": self.sqlite.stats,
             "jsonl": self.jsonl.stats,
             "correlation": self.correlation.stats,
+            "rules": self.rules.stats,
             "collectors": {
                 c.name: {"running": c.is_running, "enabled": c.enabled()}
                 for c in self.collectors
