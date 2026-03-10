@@ -1,149 +1,300 @@
 # blutruth/rules/security.yaml — Security anomaly detection rules
 #
 # Patterns that may indicate security attacks or unexpected security events.
-# Severity SUSPICIOUS is used for patterns that are anomalous but not
-# definitively malicious — they warrant investigation.
+# SUSPICIOUS is used for patterns that are anomalous but not definitively malicious.
 #
-# Implemented as pattern rules rather than a separate collector because
-# security events are just patterns on the same event stream.
+# event_type values from HCI collector:
+#   DISCONNECT, AUTH_COMPLETE, AUTH_FAILURE, ENCRYPT_CHANGE, LE_ADV_REPORT,
+#   CONNECT, CONNECT_FAILED, IO_CAP, PAIR_COMPLETE, SMP_PAIRING, HCI_EVT, HCI_MGMT
+#
+# reason_name values match btmon output (title case). Compound names like
+# "LMP Response Timeout / LL Response Timeout" are normalized to the first part.
+#
+# Reference: NIST SP 800-121r2, CVE-2019-9506 (KNOB), CVE-2020-10135 (BIAS),
+# CVE-2020-26555 (BR/EDR PIN Pairing), Linux kernel hci_core.h thresholds.
 
 rules:
 
-  - id: unexpected_just_works_pairing
-    name: "Unexpected Just Works Pairing"
+  # ---------------------------------------------------------------------------
+  # KNOB Attack (CVE-2019-9506) — Encryption key size reduction
+  # ---------------------------------------------------------------------------
+
+  - id: knob_attack_critical
+    name: "KNOB Attack — Critical Key Size"
     description: >
-      A pairing request was accepted via Just Works (no PIN, no numeric
-      comparison) from a device not previously seen. Just Works provides
-      no man-in-the-middle protection. In environments where you control
-      all BT devices, any new Just Works pairing is anomalous.
+      Encryption key size negotiated below 7 bytes (the kernel-enforced minimum).
+      The KNOB attack (CVE-2019-9506) forces key entropy to 1 byte, making
+      brute force feasible in seconds on consumer hardware. Key sizes below 7
+      are not spec-compliant on modern implementations — this is almost certainly
+      an attack or a severely broken remote device.
     triggers:
       - source: HCI
-        event_type: PAIR_REQUEST
+        event_type: HCI_EVT
         conditions:
-          method: just_works
-      - source: DBUS
-        event_type: DBUS_PROP
-        conditions:
-          key: Paired
-          value: true
-    time_window_ms: 30000
+          knob_risk: HIGH
+    time_window_ms: 100
     same_device: true
     severity: SUSPICIOUS
-    summary: "Just Works pairing completed with {device_addr} — no MITM protection"
+    summary: "KNOB attack on {device_addr} — key_size critically low"
     action: >
-      Verify this pairing was intentional. Just Works has no MITM protection.
-      If unexpected, remove the pairing immediately: bluetoothctl remove <addr>.
-      Consider enabling SSP Numeric Comparison for all devices.
+      Disconnect immediately. This key size provides near-zero security.
+      The connection should not be used for any sensitive operation.
+      Re-pair once the remote device firmware is updated.
+      Reference: CVE-2019-9506, NIST SP 800-121r2.
+
+  - id: knob_attack_possible
+    name: "KNOB Attack — Weakened Key Size"
+    description: >
+      Encryption key size negotiated below 16 bytes (the 128-bit AES maximum).
+      The Bluetooth spec permits shorter keys for legacy compatibility, but
+      NIST SP 800-121r2 recommends Secure Connections Only Mode which requires
+      the full 128-bit key. Any reduction is worth investigating — legitimate
+      devices rarely negotiate below 16 bytes.
+    triggers:
+      - source: HCI
+        event_type: HCI_EVT
+        conditions:
+          knob_risk: POSSIBLE
+    time_window_ms: 100
+    same_device: true
+    severity: WARN
+    summary: "Weakened encryption key on {device_addr} — key_size below 128-bit"
+    action: >
+      Note the key_size value in the event. If consistently below 16, the remote
+      device may be using legacy encryption mode. Consider enabling
+      Secure Connections Only Mode in bluetoothd config.
+      Reference: CVE-2019-9506.
+
+  # ---------------------------------------------------------------------------
+  # Authentication anomalies
+  # ---------------------------------------------------------------------------
 
   - id: auth_failure_unknown_device
     name: "Authentication Failure from Unknown Device"
     description: >
-      Authentication failure from a device with no prior connection history.
+      Authentication failure from a device that may not be in your pairing history.
       Could indicate a device attempting to use a guessed or default link key.
+      Single auth failures from unknown devices are more suspicious than repeated
+      failures from a known-but-broken paired device.
     triggers:
       - source: HCI
         event_type: AUTH_FAILURE
     time_window_ms: 100
     same_device: true
-    severity: SUSPICIOUS
-    summary: "Auth failure from unknown device {device_addr}"
+    severity: WARN
+    summary: "Auth failure from {device_addr} — possible unknown device probing"
     action: >
-      Investigate device identity. Check OUI manufacturer.
-      If device is not yours, consider blocking it.
+      Check if this device is in your pairing history.
+      If unrecognised, consider blocking: bluetoothctl block <addr>.
+      Check OUI manufacturer to assess likelihood it's a legitimate device.
 
-  - id: scan_flood
-    name: "BLE Advertising Scan Flood"
+  - id: controller_throttled_auth
+    name: "Controller Throttled — Repeated Attempts"
     description: >
-      Same device address appearing in LE Advertising Reports repeatedly
-      (20+ times) without establishing a connection. May indicate a device
-      running continuous proximity scanning or an advertising-based attack.
+      The local controller emitted HCI error 0x17 (Repeated Attempts), meaning
+      it is throttling authentication requests from the remote device. This is
+      the controller's own defence mechanism against brute-force link key
+      guessing. Seeing this error means an attacker is already triggering the
+      hardware-level rate limiter.
     triggers:
       - source: HCI
-        event_type: LE_ADV_REPORT
-      - source: HCI
-        event_type: LE_ADV_REPORT
-      - source: HCI
-        event_type: LE_ADV_REPORT
-      - source: HCI
-        event_type: LE_ADV_REPORT
-      - source: HCI
-        event_type: LE_ADV_REPORT
-    time_window_ms: 10000
+        event_type: DISCONNECT
+        conditions:
+          reason_name: "Repeated Attempts"
+    time_window_ms: 100
     same_device: true
     severity: SUSPICIOUS
-    summary: "Advertising flood from {device_addr} — high-frequency BLE advertising"
+    summary: "Controller throttled {device_addr} — hardware rate limit hit (0x17)"
     action: >
-      High-frequency advertising can indicate proximity tracking beacons,
-      continuous scanning tools, or advertising-based fingerprinting.
-      Check OUI of the advertiser. Random/resolvable addresses are less
-      concerning than static addresses.
+      The remote device attempted authentication too many times in rapid succession.
+      This is the controller's own detection firing. Block the device and investigate.
+      If this is a legitimate device, it may have corrupted pairing state — re-pair.
 
-  - id: bias_indicator
-    name: "BIAS Attack Indicator"
-    description: >
-      Authentication was requested but no encryption change followed within
-      the expected window. This pattern matches one indicator of the BIAS
-      (Bluetooth Impersonation AttackS) attack — where an attacker completes
-      authentication without establishing encryption.
-      Note: This is a weak indicator; confirm with full HCI trace before acting.
-    triggers:
-      - source: HCI
-        event_type: AUTH_COMPLETE
-      - source: HCI
-        event_type: ENCRYPT_CHANGE
-    time_window_ms: 2000
-    same_device: true
-    severity: SUSPICIOUS
-    summary: "Auth without encryption on {device_addr} — possible BIAS indicator"
-    action: >
-      Confirm with full HCI trace (btmon). If auth completes but encryption
-      never starts, this may indicate a BIAS attack. Force disconnect and
-      remove the pairing. File a bug if reproducible with a known-good device.
-      Reference: CVE-2020-10135
-
-  - id: device_impersonation
-    name: "Possible Device Impersonation"
-    description: >
-      Two different Bluetooth addresses advertising the same device name
-      within a short time window. Could indicate a spoofing attack where
-      an attacker clones a device's advertised name to intercept connections.
-      False positive possible if you own two devices with the same name.
-    triggers:
-      - source: DBUS
-        event_type: DBUS_PROP
-        conditions:
-          key: Name
-      - source: DBUS
-        event_type: DBUS_PROP
-        conditions:
-          key: Name
-    time_window_ms: 5000
-    same_device: false
-    severity: SUSPICIOUS
-    summary: "Same device name from different addresses — possible impersonation"
-    action: >
-      Check if you own two devices with identical names. If not, one may be
-      spoofing the other's identity. Check OUI of both addresses.
-      Do not connect to the unknown address.
+  # ---------------------------------------------------------------------------
+  # Encryption / secure channel anomalies
+  # ---------------------------------------------------------------------------
 
   - id: mic_failure_disconnect
     name: "MIC Failure Disconnect"
     description: >
       Connection terminated due to Message Integrity Check failure (0x3D).
       The encrypted link's authentication tag failed verification. This can
-      indicate key compromise, a man-in-the-middle attack, or a serious
-      firmware bug. Should be investigated if not immediately explainable.
+      indicate key compromise, a man-in-the-middle attack intercepting and
+      modifying packets, or a severe firmware bug. Should be investigated
+      whenever it occurs with a known-good device.
     triggers:
       - source: HCI
         event_type: DISCONNECT
         conditions:
-          reason_name: CONNECTION_TERMINATED_MIC_FAILURE
+          reason_name: "Connection Terminated due to MIC Failure"
     time_window_ms: 100
     same_device: true
-    severity: ERROR
+    severity: SUSPICIOUS
     summary: "MIC failure disconnect on {device_addr} — possible key compromise or MITM"
     action: >
       Re-pair the device immediately (link key may be compromised).
-      If recurring with the same device, investigate for MITM attack.
-      Check if any other devices disconnected around the same time
-      (could indicate relay attack). Reference: CVE-2020-26555 (KNOB related).
+      If recurring with the same device, investigate for MITM relay attack.
+      Check if other nearby devices disconnected simultaneously.
+      Reference: CVE-2020-26555 (PIN pairing related), CVE-2019-9506 (KNOB).
+
+  - id: encryption_rejected
+    name: "Encryption Mode Not Acceptable"
+    description: >
+      Disconnect with reason 0x25 (Encryption Mode Not Acceptable). The remote
+      device refused the encryption mode proposed by the local host — or vice
+      versa. May indicate a forced encryption downgrade attempt, or a device
+      that only supports deprecated modes (e.g. E0 stream cipher instead of AES).
+    triggers:
+      - source: HCI
+        event_type: DISCONNECT
+        conditions:
+          reason_name: "Encryption Mode Not Acceptable"
+    time_window_ms: 100
+    same_device: true
+    severity: WARN
+    summary: "Encryption rejected on {device_addr} — mode negotiation failed (0x25)"
+    action: >
+      Check if the remote device requires a specific encryption mode.
+      If this is a new device, verify it supports the host's security policy.
+      Persistent occurrence may indicate a downgrade attack.
+
+  - id: insufficient_security_disconnect
+    name: "Insufficient Security Disconnect"
+    description: >
+      Disconnect with reason 0x2F (Insufficient Security). The link's security
+      level did not meet what was required to access a profile or service.
+      Can be triggered legitimately when connecting to a high-security service
+      without prior bonding, or by a device that downgraded security parameters.
+    triggers:
+      - source: HCI
+        event_type: DISCONNECT
+        conditions:
+          reason_name: "Insufficient Security"
+    time_window_ms: 100
+    same_device: true
+    severity: WARN
+    summary: "Insufficient security on {device_addr} — security level mismatch (0x2F)"
+    action: >
+      Check if the device is bonded and using the correct security mode.
+      If connecting to a BLE service, ensure the device is paired/bonded first.
+      Repeated occurrence may indicate a security downgrade attempt.
+
+  # ---------------------------------------------------------------------------
+  # SSP / Pairing anomalies
+  # ---------------------------------------------------------------------------
+
+  - id: ssp_noio_pairing
+    name: "NoInputNoOutput SSP Pairing"
+    description: >
+      Remote device reported IO capability NoInputNoOutput (0x03) during SSP
+      pairing. This forces Just Works mode with zero MITM protection regardless
+      of what the local device is capable of. Legitimate for headsets and IoT
+      sensors, but suspicious if previously paired with a higher-capability mode
+      or if the device class indicates it has I/O capability.
+    triggers:
+      - source: HCI
+        event_type: IO_CAP
+        conditions:
+          io_capability: "NoInputNoOutput"
+    time_window_ms: 100
+    same_device: true
+    severity: WARN
+    summary: "NoInputNoOutput pairing with {device_addr} — no MITM protection"
+    action: >
+      Verify this device is legitimately NOIO (headset, sensor, IoT device).
+      If this is a phone or computer, it may be spoofing its IO capability to
+      force Just Works and eliminate MITM protection.
+      Do not pair if unexpected. Reference: NIST SP 800-121r2 section 4.2.
+
+  - id: unexpected_just_works_pairing
+    name: "Unexpected Just Works Pairing Completed"
+    description: >
+      SMP pairing followed by D-Bus Paired=true without numeric confirmation.
+      Just Works provides no man-in-the-middle protection. In environments where
+      you control all BT devices, any new Just Works pairing from an unknown
+      device is anomalous.
+    triggers:
+      - source: HCI
+        event_type: SMP_PAIRING
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          Paired: true
+    time_window_ms: 30000
+    same_device: true
+    severity: SUSPICIOUS
+    summary: "Just Works pairing completed with {device_addr} — no MITM protection"
+    action: >
+      Verify this pairing was intentional. Just Works has no MITM protection.
+      If unexpected: bluetoothctl remove <addr>.
+      Consider enabling SSP Numeric Comparison for all devices.
+
+  # ---------------------------------------------------------------------------
+  # Device identity / impersonation
+  # ---------------------------------------------------------------------------
+
+  - id: device_impersonation
+    name: "Possible Device Impersonation"
+    description: >
+      Two different Bluetooth addresses advertising the same device name within
+      a short time window. Could indicate a spoofing attack (BtleJuice/GATTacker
+      style) where an attacker clones a device's name to intercept connections.
+      False positive if you own two devices with the same name.
+    triggers:
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          Name: ""
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          Name: ""
+    time_window_ms: 5000
+    same_device: false
+    severity: SUSPICIOUS
+    summary: "Same device name from different addresses — possible impersonation"
+    action: >
+      Check if you own two devices with identical names. If not, one address
+      may be cloning the other's identity. Check OUI of both addresses.
+      Do not connect to the unrecognised address.
+
+  # ---------------------------------------------------------------------------
+  # BLE advertising anomalies
+  # ---------------------------------------------------------------------------
+
+  - id: scan_flood
+    name: "BLE Advertising Scan Flood"
+    description: >
+      Same device address appearing in LE Advertising Reports 5+ times within
+      2 seconds (2.5/s sustained). Legitimate fast advertising (during pairing
+      window) runs at 3-10 packets/s but should establish a connection within
+      seconds. Sustained high-rate advertising without connection is anomalous.
+      May indicate continuous proximity tracking or advertising-based fingerprinting.
+    triggers:
+      - source: HCI
+        event_type: LE_ADV_REPORT
+      - source: HCI
+        event_type: LE_ADV_REPORT
+      - source: HCI
+        event_type: LE_ADV_REPORT
+      - source: HCI
+        event_type: LE_ADV_REPORT
+      - source: HCI
+        event_type: LE_ADV_REPORT
+    time_window_ms: 2000
+    same_device: true
+    severity: WARN
+    summary: "Advertising flood from {device_addr} — high-frequency BLE advertising"
+    action: >
+      High-frequency sustained advertising without connection indicates a tracking
+      beacon or scanning tool. Check OUI of the advertiser.
+      Random/resolvable private addresses are less concerning than static addresses.
+
+  # ---------------------------------------------------------------------------
+  # BIAS NOTE: CVE-2020-10135 detection requires "NOT followed by" trigger
+  # support (a planned future feature in the rule engine). The attack fires when
+  # AUTH_COMPLETE occurs WITHOUT a subsequent ENCRYPT_CHANGE. Until negation
+  # triggers are supported, BIAS detection cannot be expressed as a pattern rule.
+  # Monitor the HCI trace manually: look for AUTH_COMPLETE events with no
+  # subsequent ENCRYPT_CHANGE within 2 seconds on the same handle.
+  # ---------------------------------------------------------------------------

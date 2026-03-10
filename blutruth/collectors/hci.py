@@ -317,6 +317,14 @@ class HciCollector(Collector):
         severity, stage = self._classify(header, full_text)
         event_type = self._event_type(direction, header)
 
+        # Override: Authentication Complete with error → AUTH_FAILURE
+        # btmon format: "Status: Authentication Failure (0x05)" (text first, hex in parens)
+        if event_type == "AUTH_COMPLETE":
+            import re as _re
+            _fail_re = _re.compile(r"Status:\s+(?!Success)[^\(]+\(0x(?!00)[0-9a-f]{2}\)", _re.I)
+            if _fail_re.search(full_text):
+                event_type = "AUTH_FAILURE"
+
         # Extract adapter
         adapter = None
         adapter_m = _ADAPTER_RE.search(block[0] if block else "")
@@ -385,6 +393,8 @@ class HciCollector(Collector):
         reason_m = _REASON_RE.search(full_text)
         if reason_m:
             reason_name = reason_m.group(1).strip()
+            # Normalize compound reason names: "LMP Response Timeout / LL Response Timeout" → "LMP Response Timeout"
+            reason_name = reason_name.split(" / ")[0].strip()
             reason_code = int(reason_m.group(2), 16)
 
         # Extract encryption key size if present (KNOB attack indicator)
@@ -455,13 +465,45 @@ class HciCollector(Collector):
         return ("INFO", None)
 
     def _event_type(self, direction: Optional[str], header: str) -> str:
-        """Map btmon direction + header to event_type tag."""
+        """Map btmon direction + header to event_type tag.
+
+        Specific types are checked first (for rule matching) then direction-based
+        fallbacks. Caller may override AUTH_COMPLETE → AUTH_FAILURE after severity
+        is determined.
+        """
+        h = header.lower()
+
+        # Specific types checked before direction so MGMT events also get them
+        if "disconnection complete" in h:
+            return "DISCONNECT"
+        if "authentication complete" in h:
+            return "AUTH_COMPLETE"  # may be overridden to AUTH_FAILURE in _emit_event
+        if "encryption change" in h:
+            return "ENCRYPT_CHANGE"
+        if "le advertising report" in h or "le extended advertising report" in h:
+            return "LE_ADV_REPORT"
+        if "connection complete" in h:  # checked AFTER disconnection complete
+            return "CONNECT"
+        if "connect failed" in h:
+            return "CONNECT_FAILED"
+        if "io capability" in h:
+            return "IO_CAP"
+        if "simple pairing complete" in h:
+            return "PAIR_COMPLETE"
+        if "link key notification" in h:
+            return "LINK_KEY"
+        if "smp: pairing failed" in h:
+            return "SMP_PAIR_FAILED"
+        if "smp: pairing" in h:
+            return "SMP_PAIRING"
+        if "hardware error" in h:
+            return "HCI_HARDWARE_ERROR"
+
+        # Direction-based fallbacks
         if direction == "=":
             return "HCI_INDEX"
         if direction == "@":
             return "HCI_MGMT"
-
-        h = header.lower()
         if "command:" in h and "complete" not in h and "status" not in h:
             return "HCI_CMD"
         if "event:" in h or "complete" in h or "status" in h:

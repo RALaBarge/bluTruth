@@ -550,3 +550,155 @@ async def test_handle_extracted_into_raw_json():
 
     ev = bus.last()
     assert ev.raw_json.get("handle") == 512
+
+
+# ---------------------------------------------------------------------------
+# HciCollector._event_type — specific event_type values for rule matching
+# ---------------------------------------------------------------------------
+
+def test_event_type_disconnect():
+    collector, _ = _make_collector()
+    assert collector._event_type(">", "HCI Event: Disconnection Complete (0x05)") == "DISCONNECT"
+
+
+def test_event_type_connect():
+    collector, _ = _make_collector()
+    assert collector._event_type(">", "HCI Event: Connection Complete (0x03)") == "CONNECT"
+
+
+def test_event_type_le_connection_also_connect():
+    collector, _ = _make_collector()
+    assert collector._event_type(">", "HCI Event: LE Connection Complete (0x01)") == "CONNECT"
+
+
+def test_event_type_auth_complete():
+    collector, _ = _make_collector()
+    assert collector._event_type(">", "HCI Event: Authentication Complete (0x06)") == "AUTH_COMPLETE"
+
+
+def test_event_type_encrypt_change():
+    collector, _ = _make_collector()
+    assert collector._event_type(">", "HCI Event: Encryption Change (0x08)") == "ENCRYPT_CHANGE"
+
+
+def test_event_type_le_adv_report():
+    collector, _ = _make_collector()
+    assert collector._event_type(">", "HCI Event: LE Advertising Report") == "LE_ADV_REPORT"
+
+
+def test_event_type_connect_failed():
+    collector, _ = _make_collector()
+    assert collector._event_type("@", "MGMT Event: Connect Failed (0x0011)") == "CONNECT_FAILED"
+
+
+def test_event_type_io_cap():
+    collector, _ = _make_collector()
+    assert collector._event_type(">", "HCI Event: IO Capability Response (0x32)") == "IO_CAP"
+    assert collector._event_type(">", "HCI Event: IO Capability Request (0x31)") == "IO_CAP"
+
+
+def test_event_type_smp_pairing():
+    collector, _ = _make_collector()
+    assert collector._event_type(">", "SMP: Pairing Request") == "SMP_PAIRING"
+
+
+def test_event_type_smp_pair_failed():
+    collector, _ = _make_collector()
+    assert collector._event_type(">", "SMP: Pairing Failed") == "SMP_PAIR_FAILED"
+
+
+def test_event_type_hardware_error():
+    collector, _ = _make_collector()
+    assert collector._event_type(">", "HCI Event: Hardware Error (0x10)") == "HCI_HARDWARE_ERROR"
+
+
+def test_event_type_disconnect_beats_connect():
+    # "Disconnection Complete" contains "connection complete" — must not return CONNECT
+    collector, _ = _make_collector()
+    result = collector._event_type(">", "HCI Event: Disconnection Complete (0x05)")
+    assert result == "DISCONNECT"
+    assert result != "CONNECT"
+
+
+def test_event_type_hci_cmd_fallback():
+    collector, _ = _make_collector()
+    assert collector._event_type("<", "HCI Command: LE Set Scan Parameters (0x200b)") == "HCI_CMD"
+
+
+def test_event_type_hci_evt_fallback():
+    collector, _ = _make_collector()
+    assert collector._event_type(">", "HCI Event: Command Complete (0x0e)") == "HCI_EVT"
+
+
+def test_event_type_hci_index():
+    collector, _ = _make_collector()
+    assert collector._event_type("=", "New Index: 7C:10:C9:75:8D:37 (Primary,USB,hci0)") == "HCI_INDEX"
+
+
+# ---------------------------------------------------------------------------
+# HciCollector._emit_event: AUTH_FAILURE override
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_auth_failure_event_type_on_failed_auth():
+    collector, bus = _make_collector()
+
+    block = [
+        "> HCI Event: Authentication Complete (0x06) [hci0]",
+        "        Status: Authentication Failure (0x05)",
+        "        Handle: 256",
+    ]
+    await collector._emit_event(">", "HCI Event: Authentication Complete (0x06)", block)
+
+    ev = bus.last()
+    assert ev.event_type == "AUTH_FAILURE"
+
+
+@pytest.mark.asyncio
+async def test_auth_complete_event_type_on_success():
+    collector, bus = _make_collector()
+
+    block = [
+        "> HCI Event: Authentication Complete (0x06) [hci0]",
+        "        Status: Success (0x00)",
+        "        Handle: 256",
+    ]
+    await collector._emit_event(">", "HCI Event: Authentication Complete (0x06)", block)
+
+    ev = bus.last()
+    assert ev.event_type == "AUTH_COMPLETE"
+
+
+# ---------------------------------------------------------------------------
+# reason_name normalization (compound btmon names)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_reason_name_normalized_lmp_timeout():
+    collector, bus = _make_collector()
+
+    block = [
+        "> HCI Event: Disconnection Complete (0x05) [hci0]",
+        "        Handle: 10",
+        "        Reason: LMP Response Timeout / LL Response Timeout (0x22)",
+    ]
+    await collector._emit_event(">", "HCI Event: Disconnection Complete (0x05)", block)
+
+    ev = bus.last()
+    # Normalized: compound "A / B" → just "A"
+    assert ev.raw_json.get("reason_name") == "LMP Response Timeout"
+
+
+@pytest.mark.asyncio
+async def test_reason_name_not_affected_when_no_slash():
+    collector, bus = _make_collector()
+
+    block = [
+        "> HCI Event: Disconnection Complete (0x05) [hci0]",
+        "        Handle: 10",
+        "        Reason: Connection Timeout (0x08)",
+    ]
+    await collector._emit_event(">", "HCI Event: Disconnection Complete (0x05)", block)
+
+    ev = bus.last()
+    assert ev.raw_json.get("reason_name") == "Connection Timeout"

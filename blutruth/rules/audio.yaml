@@ -1,97 +1,139 @@
 # blutruth/rules/audio.yaml — Audio pipeline pattern rules
 #
-# Patterns that indicate audio quality or codec issues.
+# Patterns that indicate audio quality or codec negotiation issues.
 # Correlates HCI, D-Bus, and PipeWire events.
+#
+# D-Bus PropertiesChanged events (event_type: DBUS_PROP) have:
+#   raw_json["interface"] — the BlueZ interface name
+#   raw_json["changed"]   — dict of changed property names/values
+#   raw_json["codec_name"] — decoded codec name (SBC/MP3/AAC/ATRAC/Vendor) if Codec changed
 
 rules:
 
-  - id: a2dp_codec_fallback
-    name: "A2DP Codec Fallback"
+  - id: a2dp_codec_downgrade_to_sbc
+    name: "A2DP Codec Downgraded to SBC"
     description: >
-      Device negotiated one codec (e.g., aptX/LDAC) during pairing but is now
-      using SBC. Indicates codec negotiation failure or compatibility fallback.
-      Common cause of unexpected audio quality drop.
+      A2DP transport established using SBC codec. SBC is the mandatory baseline
+      codec (lowest quality). If your device supports AAC, aptX, LDAC, or LC3,
+      a fallback to SBC indicates codec negotiation failed — typically due to RF
+      degradation, PipeWire configuration, or a bluetoothd codec selection bug.
+      This is the most common cause of unexpected audio quality drops.
     triggers:
       - source: DBUS
         event_type: DBUS_PROP
         conditions:
-          key: Codec
-    time_window_ms: 2000
+          codec_name: SBC
+    time_window_ms: 100
     same_device: true
     severity: WARN
-    summary: "A2DP codec change on {device_addr} — possible quality fallback"
+    summary: "A2DP codec is SBC on {device_addr} — quality fallback occurred"
     action: >
-      Check which codec is now active. If downgraded to SBC, investigate
-      aptX/LDAC driver support. May indicate RF degradation forcing simpler codec.
+      Check which codec the device advertises (bluetoothctl info <addr>).
+      If AAC/aptX/LDAC capable, SBC fallback suggests codec negotiation failed.
+      Try: disconnect, re-connect. Check PipeWire codec config in
+      /etc/pipewire/media-session.d/bluez-monitor.conf.
+      Persistent SBC may indicate RF quality too low for higher-bitrate codecs.
+
+  - id: a2dp_codec_change
+    name: "A2DP Codec Changed Mid-Session"
+    description: >
+      A2DP codec changed while a transport was already active. This is unusual
+      mid-session — codec is normally fixed at transport setup. May indicate
+      the transport was torn down and re-established with a different codec,
+      which will cause a brief audio dropout.
+    triggers:
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          interface: org.bluez.MediaTransport1
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          interface: org.bluez.MediaTransport1
+    time_window_ms: 5000
+    same_device: true
+    severity: INFO
+    summary: "A2DP transport reconfigured on {device_addr} — codec may have changed"
+    action: >
+      Check raw_json.codec_name in both events to see if codec changed.
+      Transport reconfiguration causes a brief audio dropout — normal if
+      re-connecting, potentially problematic if happening spontaneously.
 
   - id: sco_connection_fail
-    name: "SCO/HFP Connection Failure"
+    name: "SCO/eSCO Connection Failure"
     description: >
-      SCO (voice call / HFP) connection failed. Seen as HCI error on SCO setup
-      followed by D-Bus disconnect on the HFP profile. Results in call audio
-      dropping or voice assistant failure.
+      Synchronous connection (SCO/eSCO — used for HFP voice calls and voice
+      assistants) failed or disconnected. Results in call audio dropping or
+      voice assistant failing to activate. SCO uses dedicated air time slots
+      and fails if the controller cannot allocate them (too many ACL connections)
+      or if codec negotiation (CVSD vs mSBC/LC3) fails.
     triggers:
       - source: HCI
         event_type: DISCONNECT
         conditions:
-          stage: SCO
+          stage: AUDIO
       - source: DBUS
         event_type: DBUS_PROP
         conditions:
-          key: Connected
-          value: false
+          Connected: false
     time_window_ms: 1000
     same_device: true
     severity: ERROR
-    summary: "SCO/HFP disconnect on {device_addr}"
+    summary: "SCO/HFP disconnect on {device_addr} — voice audio lost"
     action: >
-      Check whether other ACL connections are active (SCO requires free slots).
-      Verify microphone/headset profile is accepted. Check for codec negotiation
-      issues (CVSD vs mSBC).
-
-  - id: audio_glitch_rtt_spike
-    name: "Audio Glitch with RTT Spike"
-    description: >
-      L2CAP RTT spike observed alongside an audio pipeline event. High RTT
-      during audio playback indicates RF degradation is the likely cause of
-      audio glitches rather than a software issue.
-    triggers:
-      - source: SYSFS
-        event_type: L2PING_RTT
-        conditions:
-          rtt_avg_ms: 50  # approximate — will match if > threshold too
-      - source: DAEMON
-        event_type: DAEMON_LOG
-    time_window_ms: 5000
-    same_device: true
-    severity: WARN
-    summary: "RF latency spike near audio event on {device_addr} — RF likely cause"
-    action: >
-      RF degradation suspected. Move device closer, check for 2.4GHz
-      interference (WiFi ch1/6/11, microwave). Consider switching WiFi to 5GHz.
+      Check: (1) Are too many ACL connections active? SCO needs free slots.
+      (2) Is the HFP profile accepted? Check bluetoothctl info <addr>.
+      (3) Codec negotiation: mSBC (HD voice) may not be supported by adapter.
+      Try adding --ncompat to bluetoothd flags to disable mSBC if CVSD works.
 
   - id: a2dp_suspend_resume_flood
     name: "A2DP Suspend/Resume Flood"
     description: >
-      Rapid A2DP transport state changes (active→idle→active) without user
-      action. Indicates buffer underruns, PipeWire scheduling issues, or
-      device power management aggressively suspending the BT link.
+      Rapid A2DP transport state changes without user action. The transport
+      cycling active→idle→active indicates buffer underruns (PipeWire sending
+      data too slowly), device power management aggressively suspending the BT
+      link during silence, or RF-induced packet loss causing the transport to
+      stall and restart.
     triggers:
       - source: DBUS
         event_type: DBUS_PROP
         conditions:
           interface: org.bluez.MediaTransport1
-          key: State
       - source: DBUS
         event_type: DBUS_PROP
         conditions:
           interface: org.bluez.MediaTransport1
-          key: State
     time_window_ms: 2000
     same_device: true
     severity: WARN
     summary: "Rapid A2DP state changes on {device_addr} — possible buffer underrun"
     action: >
-      Check PipeWire/PulseAudio buffer settings. Increase quantum size.
-      Check if device's power management is too aggressive.
-      Monitor with `pw-top` during playback.
+      Check PipeWire/PulseAudio buffer settings — increase quantum size.
+      Monitor with 'pw-top' during playback. If state change correlates with
+      silence (device suspending), set power management: BlueZ experimental
+      features or disable A2DP sink suspend in PipeWire config.
+
+  - id: audio_disconnect_on_rssi_drop
+    name: "Audio Disconnect Following RSSI Drop"
+    description: >
+      Active-connection RSSI dropped to warning/error levels shortly before an
+      audio disconnect. This pattern confirms RF degradation (not software) as
+      the root cause of audio interruption. Distinguishes "weak signal" from
+      "bluetoothd bug" in audio quality debugging.
+    triggers:
+      - source: HCI
+        event_type: HCI_EVT
+        conditions:
+          rssi_dbm: -75   # approximate: matches if rssi_dbm == -75 exactly,
+                          # but severity WARN/ERROR already set on the event
+      - source: HCI
+        event_type: DISCONNECT
+    time_window_ms: 30000
+    same_device: true
+    severity: WARN
+    summary: "Audio disconnect after RSSI drop on {device_addr} — RF cause confirmed"
+    action: >
+      RF degradation caused this audio dropout. Move device closer.
+      Check for 2.4GHz interference (WiFi on ch1/6/11, microwave ovens).
+      Consider switching WiFi to 5GHz to free up 2.4GHz spectrum.
+      Monitor RTT with L2ping collector for correlation.
