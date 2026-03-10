@@ -5,15 +5,12 @@ Commands:
   collect   Start the collection daemon (foreground)
   status    Show runtime status and collector health
   tail      Stream events in real time (like tail -f)
-  devices   List all known devices with event counts
+  devices   List all known devices with event counts + OUI manufacturer
   query     Query stored events with filters
   sessions  List recorded collection sessions
   replay    Replay a JSONL file through storage (re-correlates, new session)
   export    Export events to JSONL or CSV with filters
-
-FUTURE: Add 'replay' command to replay a JSONL file through correlation.
-FUTURE: Add 'export' command for btsnoop/JSON export of time ranges.
-FUTURE (Rust port): clap-based CLI with the same subcommands.
+  history   Per-device session history with disconnect analysis
 """
 
 from __future__ import annotations
@@ -227,6 +224,8 @@ async def cmd_status(args: argparse.Namespace) -> None:
     from blutruth.collectors import (
         HciCollector, DbusCollector, DaemonLogCollector,
         MgmtApiCollector, PipewireCollector, KernelDriverCollector,
+        SysfsCollector, UdevCollector, UbertoothCollector,
+        BleSnifferCollector, EbpfCollector, L2pingCollector, BatteryCollector,
     )
     from blutruth.bus import EventBus
     bus = EventBus()
@@ -235,7 +234,11 @@ async def cmd_status(args: argparse.Namespace) -> None:
         DbusCollector(bus, config),
         DaemonLogCollector(bus, config),
     ]
-    for cls in (MgmtApiCollector, PipewireCollector, KernelDriverCollector):
+    for cls in (
+        MgmtApiCollector, PipewireCollector, KernelDriverCollector,
+        SysfsCollector, UdevCollector, UbertoothCollector,
+        BleSnifferCollector, EbpfCollector, L2pingCollector, BatteryCollector,
+    ):
         if cls is not None:
             collectors.append(cls(bus, config))
 
@@ -439,15 +442,18 @@ async def cmd_devices(args: argparse.Namespace) -> None:
         print("No devices seen yet.")
         return
 
-    print(f"{'Address':20s} {'Name':25s} {'Events':>8s}  {'First Seen':25s}  {'Last Seen':25s}")
-    print("-" * 110)
+    from blutruth.enrichment.oui import enrich_oui
+    print(f"{'Address':20s} {'Manufacturer':18s} {'Name':22s} {'Events':>8s}  {'First Seen':19s}  {'Last Seen':19s}")
+    print("-" * 115)
     for d in devices:
+        mfr = enrich_oui(d['device_addr']) or ""
         print(
             f"{d['device_addr']:20s} "
-            f"{(d['device_name'] or ''):25s} "
+            f"{mfr[:18]:18s} "
+            f"{(d['device_name'] or '')[:22]:22s} "
             f"{d['event_count']:>8d}  "
-            f"{(d['first_seen'] or '')[:25]:25s}  "
-            f"{(d['last_seen'] or '')[:25]:25s}"
+            f"{(d['first_seen'] or '')[:19]:19s}  "
+            f"{(d['last_seen'] or '')[:19]:19s}"
         )
 
 

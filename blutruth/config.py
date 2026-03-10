@@ -54,19 +54,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "format": "json",
         },
         "mgmt": {
-            "enabled": False,   # requires root
+            "enabled": True,    # requires root — skipped gracefully if non-root
             "sysfs_poll_s": 5.0,
         },
         "pipewire": {
             "enabled": True,    # no root required
         },
         "kernel_trace": {
-            "enabled": False,   # requires root + debugfs
+            "enabled": True,    # requires root + debugfs — skipped gracefully if non-root
             "ftrace": False,    # opt-in: enables bluetooth tracepoints in tracefs
             "module_poll_s": 10.0,
         },
         "advanced_bluetoothd": {
-            "enabled": False,   # managed debug daemon, opt-in only
+            "enabled": False,   # managed debug daemon, opt-in only — requires deliberate setup
             "bluetoothd_path": "/usr/lib/bluetooth/bluetoothd",
         },
         "sysfs": {
@@ -77,15 +77,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "enabled": True,    # no root, no deps — always on
         },
         "ubertooth": {
-            "enabled": False,   # requires Ubertooth One hardware
-            "mock_data": False, # set True to emit synthetic events for testing
+            "enabled": True,    # no hardware → WARN + no-op; set mock_data=True to test
+            "mock_data": False,
         },
         "ble_sniffer": {
-            "enabled": False,   # requires nRF Sniffer or btlejack hardware
+            "enabled": True,    # no hardware → WARN + no-op; set mock_data=True to test
             "mock_data": False,
         },
         "ebpf": {
-            "enabled": False,   # requires root + CAP_BPF + bcc
+            "enabled": True,    # requires root + CAP_BPF — skipped gracefully if non-root
             "mock_data": False,
         },
         "l2ping": {

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 bluTruth is a Bluetooth stack diagnostic platform. It captures HCI frames (via `btmon`), D-Bus signals (via `dbus-next` watching `org.bluez`), and bluetoothd daemon logs (via `journalctl`) concurrently. All three streams are normalized into a shared event schema, written to SQLite + JSONL, and linked by a background correlation engine using time-windowed grouping.
 
-The Python prototype is the source of truth. A Rust port is planned — the database schema and `Event` format are the cross-implementation contract and must not be broken without deliberate versioning.
+Python is the sole implementation. The database schema and `Event` format are stable contracts — don't rename or remove fields; add with defaults or use `annotations`/`tags`/`misc1`/`misc2` for new data.
 
 See `2600/` for architecture decisions, HCI event taxonomy, and design notes.
 
