@@ -1,225 +1,257 @@
 # bluTruth — Unified Bluetooth Diagnostic Platform
 
-> **Status: Discovery / Prototype Phase** — Python collection daemon is standing and writing events to SQLite. Architecture is validated.
+> **Status: Active development** — Full collection daemon running, all stack layers covered, SQLite + JSONL storage, correlation engine, web UI, CLI tooling.
 
 ---
 
 ## What Is This?
 
-Most Bluetooth debugging tools look at exactly one layer of the stack in isolation. `btmon` sees HCI frames. `bluetoothctl` sees D-Bus objects. `journalctl` sees daemon log lines. None of them talk to each other, which means when a disconnect happens you are manually stitching together three different log streams and hoping the timestamps line up.
+Most Bluetooth debugging tools look at exactly one layer of the stack in isolation. `btmon` sees HCI frames. `bluetoothctl` sees D-Bus objects. `journalctl` sees daemon log lines. None of them talk to each other, which means when a disconnect happens you're manually stitching together three different log streams and hoping the timestamps line up.
 
-bluTruth solves this by running a single collection daemon that captures all three streams concurrently, normalizes them into a shared event schema, writes them to SQLite, and then runs a correlation engine that links related events across sources using time-windowed grouping. The result is a single database you can query to ask questions like *"show me every HCI event, D-Bus signal, and log line that touched device `DC:A6:32:xx:xx:xx` in the 500ms window around that disconnect."*
+bluTruth runs a single collection daemon that captures all stack layers concurrently, normalizes them into a shared event schema, writes them to SQLite + JSONL, and runs a correlation engine that links related events across sources using time-windowed grouping.
 
-I have always had issues with BT stuff not working the way in my opinion it should.  I dont know what I liked less, my devices not working or me not knowing precisely why.  This is going to help me fix that.
+When something breaks, the question isn't "which log do I check?" — it's "show me everything that touched this device in the 500ms around that disconnect, across every layer simultaneously."
+
+I have always had issues with BT stuff not working the way it should. I don't know what I liked less — my devices not working, or me not knowing precisely why. This fixes that.
 
 ---
 
 ## The Stack We're Observing
 
 ```
-Your App (Spotify, etc.)
+Your App (Spotify, etc.)         ← PipewireCollector
       ↓
 PipeWire / PulseAudio
       ↓
-BlueZ profile plugins  (A2DP · HFP · HID · ...)
+BlueZ profile plugins
       ↓
-bluetoothd  ←→  D-Bus  ←→  desktop / CLI tools
+bluetoothd ←→ D-Bus              ← DbusCollector
+      ↓                          ← DaemonLogCollector
+mgmt API (netlink)               ← MgmtApiCollector
       ↓
-mgmt API  (netlink socket to kernel)
+core bluetooth.ko                ← KernelDriverCollector (dmesg + ftrace)
+      ↓                          ← EbpfCollector (requires root + CAP_BPF)
+btusb.ko / hci_uart.ko           ← HciCollector (btmon)
+      ↓                          ← SysfsCollector (adapter state + USB power)
+hardware (USB hub, dongle)       ← UdevCollector (hotplug)
       ↓
-core  bluetooth.ko
-      ↓
-btusb.ko / hci_uart.ko
-      ↓
-hardware
+RF / air                         ← UbertoothCollector (requires hardware)
+                                 ← BleSnifferCollector (requires hardware)
 ```
 
-bluTruth currently has eyes on the **middle three layers**: HCI (via `btmon`), D-Bus (via `dbus-next` watching `org.bluez`), and bluetoothd internals (via `journalctl`). The mgmt API / kernel layer and the PipeWire handoff are documented observability gaps we will address in later phases.
+Active-monitoring collectors: L2pingCollector (RTT), BatteryCollector (GATT battery level).
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                  Collection Daemon                  │
-│                                                     │
-│  HCICollector   DBusMonitor   DaemonLogCollector    │
-│       │               │               │             │
-│       └───────────────┼───────────────┘             │
-│                       ▼                             │
-│              Shared asyncio Queue                   │
-│                       │                             │
-│                       ▼                             │
-│           Batched SQLite Writer (WAL mode)          │
-│                       │                             │
-│                       ▼                             │
-│              events.db  (SQLite)                    │
-│                       │                             │
-│                       ▼                             │
-│            Correlation Engine (background)          │
-│         (time-window grouping, group_id links)      │
-└─────────────────────────────────────────────────────┘
-```
-
-All collectors are async (`asyncio`) and feed a single queue. The database writer batches inserts to avoid per-event write overhead. The correlation engine runs background passes and stamps related events with a shared `group_id`.
-
----
-
-## Package Layout
-
-```
-blutruth/
-├── __init__.py
-├── cli.py                  # Entry point — collect / status / tail / devices
-├── db.py                   # Schema creation, WAL setup, batched writer
-├── models.py               # Normalized BluetoothEvent dataclass
-├── collectors/
-│   ├── __init__.py
-│   ├── hci.py              # Parses btmon subprocess output
-│   ├── dbus_monitor.py     # Watches org.bluez via dbus-next
-│   └── daemon_log.py       # Tails journalctl for bluetoothd
-└── correlation/
-    └── engine.py           # Time-windowed cross-source event linking
+Collectors (async, one per stack layer)
+    │  publish Event objects
+    ▼
+EventBus  (in-process fan-out pub/sub)
+    │
+    ├─▶ Runtime._writer_loop
+    │       ├─▶ SqliteSink  (batched inserts, WAL mode)
+    │       └─▶ JsonlSink   (line-delimited JSON)
+    │
+    └─▶ CorrelationEngine  (background, time-windowed group_id linking)
+    └─▶ RuleEngine         (YAML pattern rules → PATTERN_MATCH events)
 ```
 
 ---
 
 ## Event Schema
 
-Every event from every source is normalized before it hits the queue:
+Every event from every source is normalized before storage:
 
 | Field | Description |
 |---|---|
-| `id` | Auto-increment primary key |
-| `timestamp` | ISO-8601, microsecond precision |
-| `source` | `hci` · `dbus` · `daemon` |
-| `event_type` | Normalized type string |
-| `severity` | `debug` · `info` · `warning` · `error` · `critical` |
+| `ts_mono_us` | Microseconds since process start (primary sort key) |
+| `ts_wall` | ISO-8601 wall time |
+| `source` | `HCI` · `DBUS` · `DAEMON` · `KERNEL` · `SYSFS` · `RUNTIME` |
+| `severity` | `DEBUG` · `INFO` · `WARN` · `ERROR` · `SUSPICIOUS` |
+| `stage` | `DISCOVERY` · `CONNECTION` · `HANDSHAKE` · `DATA` · `AUDIO` · `TEARDOWN` |
+| `event_type` | Normalized type string (`HCI_EVT`, `DBUS_PROP`, `DISCONNECT`, …) |
 | `device_addr` | BD_ADDR if known |
-| `raw` | Original unparsed line / payload |
-| `parsed` | JSON blob of structured fields |
+| `device_name` | Friendly name if known |
+| `adapter` | `hci0` etc. |
 | `group_id` | Correlation group (NULL until correlated) |
-| `lifecycle_stage` | `discovery` · `connecting` · `connected` · `disconnecting` · `error` |
-| `source_version` | Version of the source tool that produced the data |
-| `parser_version` | Version of the parser that processed it |
-| `annotations` | Free-form JSON for user notes during active debug sessions |
-| `misc1` / `misc2` | Extra scratch fields for marking events during live triage |
+| `session_id` | Collection session (stamped at insert) |
+| `raw_json` | Full structured payload — extracted fields live here |
+| `raw` | Original unparsed line / payload |
+| `summary` | Human-readable one-liner |
+| `annotations` / `tags` | Free-form; use instead of altering normalized fields |
+| `misc1` / `misc2` | Scratch fields for live triage |
 
-The `misc1`/`misc2` fields are intentional — they exist because during active debugging you need somewhere to flag items without altering the normalized schema.  Ahh a lifetime of troubleshooting, paying off!
+`raw_json` structured fields of note:
+- `rssi_dbm` — signal strength when available (HCI + D-Bus)
+- `reason_code` / `reason_name` — HCI disconnect reason with plain-English decode
+- `handle` — HCI connection handle (mapped to device_addr automatically)
+- `key_size` / `knob_risk` — encryption key size; KNOB attack indicator
+- `io_capability` — SSP IO capability type from pairing exchange
+- `codec_name` — A2DP codec (SBC / AAC / aptX / LDAC / LC3) from MediaTransport1
 
 ---
 
 ## Getting Started
 
-### Prerequisites
-
 ```bash
-# bluez tools
-sudo apt install bluez
+# Uses uv
+bash setup.sh
 
-# Python deps
-pip install dbus-next
-
-# btmon requires cap_net_admin or sudo
+# btmon needs cap_net_admin (or run as root)
 sudo setcap cap_net_admin+eip $(which btmon)
-# or just run the daemon with sudo for now
 ```
 
-### Run the Daemon
+---
+
+## Commands
 
 ```bash
-# Collect from all three sources
-sudo python -m blutruth collect
+# Collect from all sources (foreground)
+sudo blutruth collect
+sudo blutruth collect -v                        # verbose: print events to stdout
+sudo blutruth collect --session "reproduce-bug" # named session
 
-# Disable individual collectors
-sudo python -m blutruth collect --no-hci
-sudo python -m blutruth collect --no-dbus
-sudo python -m blutruth collect --no-daemon-log
+# Collect + web UI at http://127.0.0.1:8484
+sudo blutruth serve
 
-# Verbose — print events to stdout as they arrive
-sudo python -m blutruth collect -v
-```
+# Live tail
+blutruth tail
+blutruth tail -s HCI                            # filter by source
+blutruth tail -d AA:BB:CC:DD:EE:FF              # filter by device
 
-### Query What You've Got
+# Query stored events
+blutruth query --device AA:BB:CC:DD:EE:FF --severity WARN
+blutruth query --source HCI --limit 500 --json
 
-```bash
-# Overall status
-python -m blutruth status
+# Device history — disconnect analysis across sessions
+blutruth history AA:BB:CC:DD:EE:FF
+blutruth history AA:BB:CC:DD:EE:FF --sessions 10
 
-# Live tail (like tail -f, but correlated)
-python -m blutruth tail
+# Sessions, devices, export
+blutruth sessions
+blutruth devices                                # includes OUI manufacturer
+blutruth export --format csv -o events.csv --session-id 12
 
-# Show known devices
-python -m blutruth devices
-```
+# Replay a JSONL capture (re-correlates into new session)
+blutruth replay capture.jsonl --speed 1.0
 
-### Database Location
-
-Events are written to `~/.local/share/blutruth/events.db` by default (WAL mode, safe for concurrent readers). You can open it with any SQLite client:
-
-```bash
-sqlite3 ~/.local/share/blutruth/events.db \
-  "SELECT timestamp, source, event_type, device_addr FROM events ORDER BY timestamp DESC LIMIT 50;"
+# Status / prerequisites
+blutruth status
 ```
 
 ---
 
 ## Configuration
 
-YAML config with hot-reload is on the roadmap. For now, collector behavior is controlled via CLI flags and constants at the top of each collector module.
+`~/.blutruth/config.yaml` — auto-created on first run with all defaults.
+
+Key settings:
+
+```yaml
+collectors:
+  hci:
+    rssi_warn_dbm: -75    # active-connection RSSI WARN threshold
+    rssi_error_dbm: -85   # active-connection RSSI ERROR threshold
+  l2ping:
+    poll_interval_s: 30   # RTT check interval per connected device
+    rtt_warn_ms: 50
+  battery:
+    poll_interval_s: 60
+    low_battery_warn: 20
+
+storage:
+  sqlite_path: ~/.blutruth/events.db
+  jsonl_path: ~/.blutruth/events.jsonl
+  retention_days: 30
+
+correlation:
+  time_window_ms: 100
+  rules_path: ~/.blutruth/rules/   # user YAML rule packs
+```
+
+Hot-reload: config changes apply within ~1 second (inotify-based, polling fallback).
 
 ---
 
-## What's Working Now
+## What Each Collector Catches
 
-- [x] HCI collector — parses `btmon` output into structured events with severity and lifecycle stage
-- [x] D-Bus monitor — watches `org.bluez` signals (property changes, interface add/remove, device state transitions)
-- [x] Daemon log collector — tails `journalctl` for bluetoothd output
-- [x] Shared asyncio queue + batched SQLite writer
-- [x] WAL mode for concurrent read access while daemon is running
-- [x] Correlation engine — background passes link events within time windows via `group_id`
-- [x] CLI: `collect`, `status`, `tail`, `devices`
-- [x] Normalized event schema with annotations and misc fields
-
----
-
-## Known Observability Gaps (Next Phases)
-
-| Layer | Gap | Notes |
+| Collector | What it sees | Root? |
 |---|---|---|
-| mgmt API | No listener on netlink socket | Would expose kernel↔bluetoothd control path |
-| PipeWire handoff | No capture of audio stream negotiation | Need to hook PipeWire IPC or use pw-dump |
-| kernel internals | bluetooth.ko / btusb.ko state not visible | Would require eBPF tracepoints |
-| HCI sniffer (hardware) | No air-level capture | Would need Ubertooth or similar |
+| `HciCollector` | HCI frames (btmon): connect/disconnect, auth, encryption, RSSI, key size, IO capability, handle→addr mapping | No (cap_net_admin) |
+| `DbusCollector` | All org.bluez signals: device appear/disappear, Connected, Paired, RSSI, A2DP codec, audio transport state | No |
+| `DaemonLogCollector` | bluetoothd log output via journalctl | No |
+| `MgmtApiCollector` | Kernel mgmt API (btmgmt --monitor): power state, connections at kernel level | Yes |
+| `KernelDriverCollector` | dmesg BT patterns: firmware load/fail, USB errors, driver resets, module state | Yes |
+| `SysfsCollector` | Adapter state, rfkill blocks, **USB power runtime_status** (hub power failure detection) | No |
+| `UdevCollector` | USB hotplug: adapter insert/remove, driver bind/unbind | No |
+| `EbpfCollector` | Kernel BT tracepoints (requires CAP_BPF) | Yes |
+| `L2pingCollector` | Active RTT measurement per connected device | No |
+| `BatteryCollector` | GATT Battery Service level via D-Bus | No |
+| `PipewireCollector` | Audio pipeline state (pw-dump / pactl) | No |
+| `UbertoothCollector` | Classic BT air-level (requires Ubertooth One hardware) | No |
+| `BleSnifferCollector` | BLE air-level (requires nRF sniffer / btlejack) | No |
+
+Collectors that can't start (no root, no hardware, tool not found) emit a WARN event and do nothing — they don't crash the daemon.
 
 ---
 
-## Planned: JSONL Flight Recorder
+## Diagnosing Hardware Problems
 
-A parallel JSONL log alongside SQLite for portability — lets you `scp` a flat file off a device for offline analysis without needing SQLite tooling.
+### USB hub power failure
+
+If your BT adapter disappears intermittently due to hub power issues, bluTruth shows:
+
+```
+SYSFS INFO  USB BT adapter hci0: Realtek [0bda:b00a] power=500mA status=active
+SYSFS WARN  USB adapter hci0 power: 'active' → 'suspended'
+SYSFS WARN  ADAPTER_REMOVED: hci0 [7C:10:C9:75:8D:37]
+```
+
+The `suspended` before `REMOVED` is the tell. A software disconnect or rfkill block won't produce a USB power state change. This sequence is distinctive of power starvation.
+
+### RF / antenna issues
+
+Use `blutruth history <addr>` to see disconnect reason patterns across sessions.
+`CONNECTION_TIMEOUT (0x08)` and `LMP_RESPONSE_TIMEOUT (0x22)` repeating across
+multiple sessions strongly suggests RF — cable, antenna, or interference.
+`l2ping` RTT trends (visible in the DB) confirm or rule out latency issues.
+
+### Security anomalies
+
+- `knob_risk: POSSIBLE/HIGH` in HCI events → encryption key size reduced below spec
+- `io_capability: NoInputNoOutput` when device previously used `DisplayYesNo` → potential SSP downgrade
+- Pattern rules in `blutruth/rules/security.yaml` fire `SUSPICIOUS` events for auth loops, scan floods, unexpected pairing
 
 ---
 
-## Roadmap
+## Design Decisions
 
-1. **Now** — Python prototype, validate data collection and correlation
-2. **Next** — YAML rule-pack driven correlation engine, web UI (progressive enhancement, not React SPA)
-3. **Later** — Rust port, same DB schema and event format contracts, performance for embedded targets
+**Correlation is the differentiator.** Individual tools already exist. The value is connecting events across layers with a shared `group_id`.
 
----
+**Annotations over schema changes.** Adding new data? Use `annotations`, `tags`, `misc1`, `misc2`, or `raw_json` fields. Don't alter the normalized schema.
 
-## Design Philosophy
+**Schema stability.** The SQLite schema and Event format are stable contracts. Add with defaults; don't rename or remove fields.
 
-- **Correlation is the differentiator.** Individual tools already exist. The value is in connecting events across layers.
-- **Modular collectors with declared capabilities.** Each collector exposes what root permissions it needs and what resources it holds exclusively, so the daemon can manage privilege safely.
-- **Schema stability first.** The Python prototype and the eventual Rust port share the same database schema and event format. Don't break that contract.
-- **Annotations over schema changes.** Need to mark something during a debug session? Use `annotations`, `misc1`, or `misc2`. Don't alter the normalized fields.
+**Collectors declare capabilities.** Each collector exposes what root permissions it needs and what resources it holds exclusively (`hci_monitor_socket`). The runtime checks before starting.
+
+**EventBus is best-effort.** Slow subscribers drop events. The writer loop uses `max_queue=10000`. This is intentional — the daemon stays alive even under load.
 
 ---
 
-## Contributing / Development Notes
+## Design Docs
 
-The project is currently solo (Ryan). Architecture decisions are documented in the technical spec. Before changing the event schema or collector plugin interface, read the spec — several decisions that look arbitrary have hard-won reasons behind them (the `misc1`/`misc2` fields being a good example).
+`2600/` — architecture decisions, HCI event taxonomy, collector design notes, session logs.
 
-When the Rust port begins, the Python implementation's database schema and event format are the source of truth. The Rust implementation must be a consumer-compatible replacement, not a redesign.
+```
+2600/
+├── README.md                  index
+├── architecture.md            data flow, storage, correlation engine
+├── hci_event_taxonomy.md      HCI event classification reference
+├── collector_design.md        collector plugin interface decisions
+├── changelog.md               tier-by-tier feature log
+├── session-mar05-2026.md      observability gaps, hardware sniffers, 7 value-adds
+└── session-mar09-2026.md      gap analysis, USB power, KNOB/RSSI/IO cap/codec
+```

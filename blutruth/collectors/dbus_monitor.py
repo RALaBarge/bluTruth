@@ -44,6 +44,25 @@ def _path_to_addr(path: str) -> tuple:
     return None, None
 
 
+# A2DP codec byte → human-readable name (from BlueZ MediaTransport1.Codec)
+_A2DP_CODECS: Dict[int, str] = {
+    0x00: "SBC",
+    0x01: "MP3",
+    0x02: "AAC",
+    0x03: "ATRAC",
+    0xFF: "Vendor (aptX/LDAC/LC3/aptX-HD)",
+}
+
+
+def _decode_a2dp_codec(val: Any) -> Optional[str]:
+    """Return codec name for a MediaTransport1.Codec byte value."""
+    try:
+        code = int(val)
+        return _A2DP_CODECS.get(code, f"Unknown (0x{code:02X})")
+    except (TypeError, ValueError):
+        return None
+
+
 def _classify_property_change(interface: str, changed: dict) -> tuple:
     """Return (severity, stage) based on which property changed."""
     iface = interface or ""
@@ -74,6 +93,8 @@ def _classify_property_change(interface: str, changed: dict) -> tuple:
 
     if "MediaTransport1" in iface:
         if "State" in changed:
+            return ("INFO", "AUDIO")
+        if "Codec" in changed:
             return ("INFO", "AUDIO")
         return ("INFO", "AUDIO")
 
@@ -228,6 +249,12 @@ class DbusCollector(Collector):
                 "changed": _safe_serialize(changed_plain),
                 "invalidated": list(msg.body[2]) if len(msg.body) > 2 else [],
             }
+            # Decode A2DP codec byte for MediaTransport1
+            if "MediaTransport1" in changed_iface and "Codec" in changed_plain:
+                codec_name = _decode_a2dp_codec(changed_plain["Codec"])
+                if codec_name:
+                    raw_json["codec_name"] = codec_name
+                    summary += f" [{codec_name}]"
 
         elif member == "InterfacesAdded" and msg.body:
             obj_path = msg.body[0] if msg.body else ""

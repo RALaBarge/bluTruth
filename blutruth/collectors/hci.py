@@ -128,6 +128,12 @@ _HCI_CLASSIFICATION: Dict[str, tuple] = {
     "Open Index":                       ("INFO",  None),
     "Delete Index":                     ("WARN",  None),
     "Close Index":                      ("WARN",  None),
+
+    "Hardware Error":                   ("ERROR", None),
+    "Encryption Key Refresh Complete":  ("INFO",  "HANDSHAKE"),
+    "IO Capability Request":            ("INFO",  "HANDSHAKE"),
+    "IO Capability Response":           ("INFO",  "HANDSHAKE"),
+    "IO Capability Request Reply":      ("INFO",  "HANDSHAKE"),
 }
 
 # Error-indicating patterns
@@ -142,6 +148,15 @@ _RSSI_RE = re.compile(r"RSSI:\s*(-?\d+)\s*dBm", re.I)
 
 # Disconnect reason: "Reason: Connection Timeout (0x08)"
 _REASON_RE = re.compile(r"Reason:\s+(.+?)\s*\(0x([0-9a-f]{2})\)", re.I)
+
+# Connection handle number: "Handle: 256"
+_HANDLE_RE = re.compile(r"\bHandle:\s*(\d+)")
+
+# Encryption key size: "Key size: 16" or "key size: 7"
+_KEY_SIZE_RE = re.compile(r"[Kk]ey\s+[Ss]ize:\s*(\d+)")
+
+# IO capability type: "Capability: DisplayYesNo (0x01)"
+_IO_CAP_RE = re.compile(r"^\s+Capability:\s+(.+?)\s*\(0x([0-9a-f]{2})\)", re.MULTILINE | re.I)
 
 # Device address extraction
 _ADDR_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
@@ -178,6 +193,7 @@ class HciCollector(Collector):
         super().__init__(bus, config)
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._task: Optional[asyncio.Task] = None
+        self._handle_addr: Dict[int, str] = {}
 
     def capabilities(self) -> Dict[str, Any]:
         return {
@@ -320,6 +336,22 @@ class HciCollector(Collector):
             if m:
                 device_addr = m.group(1).upper()
 
+        # Extract connection handle (first one in block)
+        handle = None
+        handle_m = _HANDLE_RE.search(full_text)
+        if handle_m:
+            handle = int(handle_m.group(1))
+
+        # Handle → device_addr mapping
+        # Store on connection complete; look up on handle-only events; remove on disconnect
+        if handle is not None:
+            if "Connection Complete" in header and device_addr:
+                self._handle_addr[handle] = device_addr
+            elif device_addr is None:
+                device_addr = self._handle_addr.get(handle)
+            if "Disconnection Complete" in header:
+                self._handle_addr.pop(handle, None)
+
         # Check for error status codes
         for pattern, err_sev in _ERROR_PATTERNS:
             m = pattern.search(full_text)
@@ -355,6 +387,27 @@ class HciCollector(Collector):
             reason_name = reason_m.group(1).strip()
             reason_code = int(reason_m.group(2), 16)
 
+        # Extract encryption key size if present (KNOB attack indicator)
+        key_size = None
+        key_m = _KEY_SIZE_RE.search(full_text)
+        if key_m:
+            key_size = int(key_m.group(1))
+            from blutruth.events import SEVERITY_ORDER
+            if key_size < 7:
+                # Definitely compromised — key entropy too low to be accidental
+                if SEVERITY_ORDER.get("ERROR", 0) > SEVERITY_ORDER.get(severity, 0):
+                    severity = "ERROR"
+            elif key_size < 16:
+                # Reduced key size — possible KNOB attack in progress
+                if SEVERITY_ORDER.get("WARN", 0) > SEVERITY_ORDER.get(severity, 0):
+                    severity = "WARN"
+
+        # Extract IO capability type if present (SSP downgrade detection)
+        io_capability = None
+        io_cap_m = _IO_CAP_RE.search(full_text)
+        if io_cap_m:
+            io_capability = io_cap_m.group(1).strip()
+
         # Direction arrow for summary
         dir_label = {"<": "\u2192", ">": "\u2190", "=": "=", "@": "@"}.get(direction, "?")
         summary = f"{dir_label} {header}"[:200]
@@ -364,11 +417,19 @@ class HciCollector(Collector):
             "header": header,
             "lines": block,
         }
+        if handle is not None:
+            raw_json["handle"] = handle
         if rssi_dbm is not None:
             raw_json["rssi_dbm"] = rssi_dbm
         if reason_code is not None:
             raw_json["reason_code"] = f"0x{reason_code:02X}"
             raw_json["reason_name"] = reason_name
+        if key_size is not None:
+            raw_json["key_size"] = key_size
+            if key_size < 16:
+                raw_json["knob_risk"] = "HIGH" if key_size < 7 else "POSSIBLE"
+        if io_capability is not None:
+            raw_json["io_capability"] = io_capability
 
         await self.bus.publish(Event.new(
             source="HCI",
