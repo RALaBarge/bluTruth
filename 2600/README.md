@@ -10,6 +10,7 @@ This directory is for the big-picture thinking: architecture decisions, design p
 | `hci_event_taxonomy.md` | Complete breakdown of HCI event types — direction markers, event classification, lifecycle stages, btmon quirks |
 | `collector_design.md` | The Collector ABC, capabilities() contract, subprocess pattern, per-collector implementation notes |
 | `changelog.md` | Running log of design-level changes — what changed, why, and what was explicitly left out |
+| `session-mar10-2026.md` | Test suite (193→212 tests), .gitignore cleanup, YAML rule packs, rule engine bug fixes (5 bugs, all rules now fire), 24 production rules across security/connection/audio |
 
 ## What Belongs Here
 

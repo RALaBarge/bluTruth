@@ -128,8 +128,52 @@ Falls back to 1s polling if watchfiles raises (path doesn't exist yet, permissio
 
 ---
 
+## 2026-03-10 — Tests, .gitignore, rule engine fixes, 24 production rules
+
+### Test suite (193→212 tests)
+
+First tests written for the project. 8 modules covering: Event schema, EventBus, HCI parser regex + `_emit_event` logic, D-Bus helper functions, sysfs USB path finding (mock sysfs tree), OUI/HCI code enrichment, Config.get() dot-path, RuleEngine trigger sequences.
+
+Discovered during testing that `decode_hci_error` returns `code` as a hex string `"0xNN"` (not an int). Tests adjusted accordingly.
+
+---
+
+### .gitignore + pycache cleanup
+
+No `.gitignore` existed. All `__pycache__/` directories were tracked. Added `.gitignore` covering Python bytecode, venvs, pytest cache, SQLite files, JSONL files. Removed all tracked pycache entries from the git index with `git rm -r --cached`.
+
+---
+
+### Rule engine bug: all rules were silently not firing
+
+Three independent bugs meant every rule in the built-in rule packs had never fired:
+
+**1. `_event_type()` returned generic `HCI_EVT` for everything.** Rules referenced `DISCONNECT`, `AUTH_FAILURE`, `ENCRYPT_CHANGE`, etc. but the HCI collector returned `HCI_EVT` for all of these. Fix: `_event_type()` now checks header content first (before direction fallbacks), returning 12 specific types. Direction-based fallbacks apply only when none of the specific patterns match.
+
+**2. `reason_name` conditions used snake_case; btmon outputs title case.** The rules had `reason_name: CONNECTION_TIMEOUT`; btmon produces `"Connection Timeout"`. `_values_match` does case-insensitive exact string comparison — these never matched. Fix: all rule conditions updated to use btmon's actual title case strings.
+
+**3. Compound reason names broke exact matching.** btmon outputs `"LMP Response Timeout / LL Response Timeout (0x22)"`. Fix: `reason_name` normalized at extraction — `split(" / ")[0]` takes only the first part, giving `"LMP Response Timeout"`.
+
+**Bonus fix — AUTH_FAILURE event_type:** Auth Complete with failure status returned `AUTH_COMPLETE`, same as success. Added post-extraction override: if event_type is `AUTH_COMPLETE` and the block contains a non-zero status code, override to `AUTH_FAILURE`. btmon format: `"Status: Authentication Failure (0x05)"` (text first, hex in parens) — required a different regex than expected.
+
+**BIAS rule removed.** The previous `bias_indicator` rule fired when AUTH_COMPLETE was *followed by* ENCRYPT_CHANGE — which is the **normal** case, not the attack. The BIAS attack fires when encryption does NOT follow authentication. The current sequential trigger model cannot express negation. Removed the rule and documented the gap in security.yaml with a comment block.
+
+---
+
+### 24 production rules (security.yaml, connection.yaml, audio.yaml)
+
+Grounded in NIST SP 800-121r2, Linux kernel `hci_core.h` thresholds, and btmon output format. No prior art existed to borrow from — Sigma, Suricata, and Snort ecosystems have zero Bluetooth detection rules.
+
+New security rules: KNOB critical (key_size < 7, SUSPICIOUS), KNOB possible (7–15, WARN), controller throttled auth (0x17 Repeated Attempts), MIC failure disconnect, encryption mode rejected, insufficient security, SSP NoInputNoOutput pairing. Existing rules fixed: scan_flood threshold tightened 10s→2s; auth_failure_unknown_device event_type corrected.
+
+New connection rules: repeated timeouts (3× within 120s), USB hub power failure (USB_POWER_CHANGE → ADAPTER_REMOVED). Existing rules fixed: silent_reconnect and lmp_timeout reason_name values corrected.
+
+Audio rules: codec downgrade to SBC (specific condition, not just any codec change), codec change correlation, SCO failure, A2DP suspend flood, audio disconnect after RSSI drop.
+
+---
+
 ## What's left
 
-**Tier 3, Item 9 — YAML rule-pack correlation:** The correlation engine currently groups events by (device_addr, time_window). Semantic rules — "KNOB attack = Encryption Change with reduced key entropy in a HANDSHAKE window", "SSP downgrade = IO Capability Request followed by capability mismatch" — are the next layer of intelligence. The `correlation.rules_path` config field is reserved for this. The `event_groups` table already has a `role` column that would carry the rule name.
+**BIAS detection (CVE-2020-10135):** Requires "negate" trigger type — rule fires when expected event does NOT appear within time window. Documented as planned FUTURE in `correlation/rules.py`. Until then: look for AUTH_COMPLETE events with no subsequent ENCRYPT_CHANGE within 2 seconds on the same handle.
 
-**Tier 3, Item 10 — Native collectors:** Remove subprocess dependencies one by one. Direct `AF_BLUETOOTH` + `BTPROTO_HCI` socket for HCI/mgmt replaces btmon. `/dev/kmsg` read loop replaces journalctl. libpipewire via ctypes or a small C extension replaces pw-dump. This is foundational for the Rust port — the Rust implementation will use these native interfaces from day one.
+**Native collectors:** Remove subprocess dependencies one by one. Direct `AF_BLUETOOTH` + `BTPROTO_HCI` socket for HCI/mgmt replaces btmon. `/dev/kmsg` read loop replaces journalctl. Not a priority for solo diagnostic use case (Python async is fast enough), but would eliminate btmon's btsnoop limitation and the -T flag crash issue.
