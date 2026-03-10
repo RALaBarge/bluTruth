@@ -1,10 +1,14 @@
 """
-blutruth.collectors.sysfs — Sysfs adapter + rfkill state collector
+blutruth.collectors.sysfs — Sysfs adapter + rfkill + USB power state collector
 
 Polls /sys/class/bluetooth/hci* and /sys/class/rfkill/ for adapter-level
 state that isn't surfaced through HCI frames or D-Bus signals. Useful for
 catching power state changes, rfkill block events, and USB disconnect/reconnect
 before bluetoothd even reacts.
+
+Also follows hciN/device → USB device sysfs node and monitors USB runtime_status
+and power budget. This is the layer that catches "USB hub not powering up
+properly" — adapter disappears + USB runtime_status=error/suspended.
 
 No root required. No external tools. Pure Python + pathlib.
 
@@ -21,9 +25,16 @@ Stack position (what this watches):
     soft            0 = not blocked, 1 = software blocked
     hard            0 = not blocked, 1 = hardware blocked
 
+  /sys/bus/usb/devices/X/   (resolved via hciN/device symlink)
+    manufacturer        USB manufacturer string
+    product             USB product string
+    idVendor/idProduct  USB VID:PID
+    bMaxPower           Power budget from USB descriptor (mA)
+    power/runtime_status  active | suspended | error | unsupported
+    power/control         auto | on
+
 FUTURE: Parse /sys/kernel/debug/bluetooth/hci*/features for richer capabilities.
 FUTURE: Parse /sys/kernel/debug/bluetooth/hci*/conn_info for connection details.
-FUTURE (Rust port): Direct sysfs reads via std::fs, inotify via notify crate.
 """
 
 from __future__ import annotations
@@ -48,6 +59,25 @@ _ADAPTER_PROPS = ["address", "type", "bus", "name", "states", "manufacturer"]
 
 # Properties to read per rfkill node
 _RFKILL_PROPS  = ["soft", "hard", "name"]
+
+# USB power sysfs files to read (relative to USB device root)
+_USB_POWER_FILES = [
+    "manufacturer",
+    "product",
+    "idVendor",
+    "idProduct",
+    "bMaxPower",
+    "power/runtime_status",
+    "power/control",
+]
+
+# USB runtime_status values and their severity
+_USB_STATUS_SEVERITY = {
+    "active":      "INFO",
+    "suspended":   "WARN",
+    "error":       "ERROR",
+    "unsupported": "DEBUG",
+}
 
 
 def _read(path: Path) -> Optional[str]:
@@ -89,6 +119,37 @@ def _rfkill_blocked(nodes: List[Dict]) -> bool:
     return False
 
 
+def _find_usb_device(hci_path: Path) -> Optional[Path]:
+    """
+    Follow hciN/device symlink up the sysfs tree to find the USB device node.
+
+    The symlink resolves to a USB interface (e.g. 1-1.3:1.0). Walk up until
+    we find a directory that has idVendor — that's the USB device proper.
+    Returns None for non-USB adapters (UART, SDIO, etc.) or if not found.
+    """
+    device_link = hci_path / "device"
+    if not device_link.exists():
+        return None
+    try:
+        p = device_link.resolve()
+        for _ in range(6):  # max depth to walk up
+            if (p / "idVendor").exists():
+                return p
+            p = p.parent
+    except Exception:
+        pass
+    return None
+
+
+def _usb_snapshot(usb_path: Path) -> Dict[str, Optional[str]]:
+    """Read USB power-related sysfs files for one USB device."""
+    snap: Dict[str, Optional[str]] = {}
+    for fname in _USB_POWER_FILES:
+        key = fname.replace("/", "_")
+        snap[key] = _read(usb_path / fname)
+    return snap
+
+
 class SysfsCollector(Collector):
     name = "sysfs"
     description = "Adapter state + rfkill via /sys/class/bluetooth"
@@ -99,6 +160,7 @@ class SysfsCollector(Collector):
         self._task: Optional[asyncio.Task] = None
         self._prev_adapters: Dict[str, Dict] = {}
         self._prev_rfkill: List[Dict] = []
+        self._prev_usb: Dict[str, Dict] = {}  # hci name → usb snapshot
 
     def capabilities(self) -> Dict[str, Any]:
         return {
@@ -159,6 +221,7 @@ class SysfsCollector(Collector):
             await asyncio.gather(
                 self._poll_adapters(),
                 self._poll_rfkill(),
+                self._poll_usb_power(),
                 return_exceptions=True,
             )
 
@@ -271,3 +334,78 @@ class SysfsCollector(Collector):
                     ))
 
         self._prev_rfkill = current
+
+    async def _poll_usb_power(self) -> None:
+        """
+        For each BT adapter, find its USB device via sysfs symlink and monitor
+        runtime_status and bMaxPower. Emits events when power state changes.
+
+        Non-USB adapters (UART, SDIO) will have no USB device — silently skipped.
+        """
+        if not _BT_CLASS.exists():
+            return
+
+        for hci_path in sorted(_BT_CLASS.iterdir()):
+            if not hci_path.name.startswith("hci"):
+                continue
+
+            usb_path = _find_usb_device(hci_path)
+            if not usb_path:
+                continue  # not a USB adapter
+
+            snap = _usb_snapshot(usb_path)
+            prev = self._prev_usb.get(hci_path.name)
+
+            if prev is None:
+                # First time we see this USB device — emit an info snapshot
+                vid = snap.get("idVendor", "?")
+                pid = snap.get("idProduct", "?")
+                mfr = snap.get("manufacturer") or snap.get("product") or "unknown"
+                power_budget = snap.get("bMaxPower", "?")
+                runtime = snap.get("power_runtime_status", "unknown")
+
+                await self.bus.publish(Event.new(
+                    source="SYSFS",
+                    severity="INFO",
+                    event_type="USB_ADAPTER_INFO",
+                    adapter=hci_path.name,
+                    summary=(
+                        f"USB BT adapter {hci_path.name}: {mfr} "
+                        f"[{vid}:{pid}] power={power_budget} status={runtime}"
+                    ),
+                    raw_json={
+                        "adapter": hci_path.name,
+                        "usb_path": str(usb_path),
+                        "usb": snap,
+                    },
+                    source_version=self.source_version_tag,
+                ))
+
+            else:
+                # Check runtime_status change
+                prev_status = prev.get("power_runtime_status")
+                curr_status = snap.get("power_runtime_status")
+
+                if curr_status != prev_status and curr_status is not None:
+                    severity = _USB_STATUS_SEVERITY.get(curr_status, "INFO")
+                    mfr = snap.get("manufacturer") or snap.get("product") or "USB device"
+                    await self.bus.publish(Event.new(
+                        source="SYSFS",
+                        severity=severity,
+                        event_type="USB_POWER_CHANGE",
+                        adapter=hci_path.name,
+                        summary=(
+                            f"USB adapter {hci_path.name} power: "
+                            f"{prev_status!r} → {curr_status!r} ({mfr})"
+                        ),
+                        raw_json={
+                            "adapter": hci_path.name,
+                            "usb_path": str(usb_path),
+                            "prev_status": prev_status,
+                            "curr_status": curr_status,
+                            "usb": snap,
+                        },
+                        source_version=self.source_version_tag,
+                    ))
+
+            self._prev_usb[hci_path.name] = snap

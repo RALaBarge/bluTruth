@@ -44,6 +44,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "collectors": {
         "hci": {
             "enabled": True,
+            "rssi_warn_dbm": -75,   # WARN when active-connection RSSI drops below this
+            "rssi_error_dbm": -85,  # ERROR when active-connection RSSI drops below this
         },
         "dbus": {
             "enabled": True,

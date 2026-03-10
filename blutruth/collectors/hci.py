@@ -21,9 +21,15 @@ Direction markers: < (host->controller) > (controller->host) = (system) @ (mgmt)
 Some lines get btmon[PID]: prefix when piped.
 NOTE: -T flag causes buffer overflow crash on btmon 5.72 when piped.
 
+RSSI extraction: raw_json["rssi_dbm"] is populated whenever btmon reports an RSSI
+value (Inquiry Result with RSSI, LE Advertising Report, Read RSSI command complete).
+Active-connection RSSI (Read RSSI) below rssi_warn_dbm/-85 thresholds bumps severity.
+
+Disconnect reason extraction: raw_json["reason_code"] + ["reason_name"] are
+populated for Disconnection Complete events, feeding the history disconnect analysis.
+
 FUTURE: Parse btmon binary output (btsnoop) directly for richer data.
 FUTURE: Simultaneous btsnoop file writing for Wireshark export.
-FUTURE (Rust port): Open HCI_MONITOR socket directly via libc, no btmon subprocess.
 """
 
 from __future__ import annotations
@@ -130,6 +136,12 @@ _ERROR_PATTERNS = [
     (re.compile(r"Reason:\s+(0x[0-9a-f]{2})\s+\((\w.+?)\)", re.I), "WARN"),
     (re.compile(r"Error:\s+(.+)", re.I), "ERROR"),
 ]
+
+# RSSI extraction: "RSSI: -60 dBm (0xc4)" or "RSSI: -70 dBm"
+_RSSI_RE = re.compile(r"RSSI:\s*(-?\d+)\s*dBm", re.I)
+
+# Disconnect reason: "Reason: Connection Timeout (0x08)"
+_REASON_RE = re.compile(r"Reason:\s+(.+?)\s*\(0x([0-9a-f]{2})\)", re.I)
 
 # Device address extraction
 _ADDR_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
@@ -317,9 +329,46 @@ class HciCollector(Collector):
                     severity = err_sev
                 break
 
+        # Extract RSSI if present
+        rssi_dbm = None
+        rssi_m = _RSSI_RE.search(full_text)
+        if rssi_m:
+            rssi_dbm = int(rssi_m.group(1))
+            # Only escalate severity for active-connection RSSI (Read RSSI command),
+            # not discovery/advertising RSSI (which being low is perfectly normal).
+            if "Read RSSI" in header:
+                from blutruth.events import SEVERITY_ORDER
+                rssi_warn = int(self.config.get("collectors", "hci", "rssi_warn_dbm", default=-75))
+                rssi_error = int(self.config.get("collectors", "hci", "rssi_error_dbm", default=-85))
+                if rssi_dbm <= rssi_error:
+                    if SEVERITY_ORDER.get("ERROR", 0) > SEVERITY_ORDER.get(severity, 0):
+                        severity = "ERROR"
+                elif rssi_dbm <= rssi_warn:
+                    if SEVERITY_ORDER.get("WARN", 0) > SEVERITY_ORDER.get(severity, 0):
+                        severity = "WARN"
+
+        # Extract disconnect reason if present
+        reason_code = None
+        reason_name = None
+        reason_m = _REASON_RE.search(full_text)
+        if reason_m:
+            reason_name = reason_m.group(1).strip()
+            reason_code = int(reason_m.group(2), 16)
+
         # Direction arrow for summary
         dir_label = {"<": "\u2192", ">": "\u2190", "=": "=", "@": "@"}.get(direction, "?")
         summary = f"{dir_label} {header}"[:200]
+
+        raw_json: Dict[str, Any] = {
+            "direction": direction,
+            "header": header,
+            "lines": block,
+        }
+        if rssi_dbm is not None:
+            raw_json["rssi_dbm"] = rssi_dbm
+        if reason_code is not None:
+            raw_json["reason_code"] = f"0x{reason_code:02X}"
+            raw_json["reason_name"] = reason_name
 
         await self.bus.publish(Event.new(
             source="HCI",
@@ -327,11 +376,7 @@ class HciCollector(Collector):
             stage=stage,
             event_type=event_type,
             summary=summary,
-            raw_json={
-                "direction": direction,
-                "header": header,
-                "lines": block,
-            },
+            raw_json=raw_json,
             raw=full_text,
             adapter=adapter,
             device_addr=device_addr,
