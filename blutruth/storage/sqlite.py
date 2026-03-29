@@ -515,12 +515,40 @@ class SqliteSink:
         self._db.commit()
         return cur.rowcount
 
+    async def roll(self, ts: str) -> Path:
+        """Flush, close, rename current DB to a timestamped backup, then reopen fresh."""
+        await self.stop()
+        backup = self.path.with_name(f"{self.path.stem}.{ts}.db")
+        self.path.rename(backup)
+        # Also move WAL / SHM sidecar files if present
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(self.path) + suffix)
+            if sidecar.exists():
+                sidecar.unlink()
+        self._total_written = 0
+        self._total_purged = 0
+        await self.start()
+        return backup
+
+    async def delete(self) -> None:
+        """Flush, close, and delete all storage files, then reopen fresh."""
+        await self.stop()
+        for suffix in ("", "-wal", "-shm"):
+            p = Path(str(self.path) + suffix) if suffix else self.path
+            if p.exists():
+                p.unlink()
+        self._total_written = 0
+        self._total_purged = 0
+        await self.start()
+
     @property
     def stats(self) -> dict:
+        size_bytes = self.path.stat().st_size if self.path.exists() else 0
         return {
             "total_written": self._total_written,
             "total_purged": self._total_purged,
             "buffer_size": len(self._buffer),
+            "size_bytes": size_bytes,
             "path": str(self.path),
             "active_session_id": self._active_session_id,
             "retention_days": self.retention_days,

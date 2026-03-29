@@ -61,6 +61,63 @@ class WebServer:
         self.app.router.add_get("/v1/stream", self._handle_stream)
         self.app.router.add_get("/v1/status", self._handle_status)
         self.app.router.add_get(r"/v1/devices/{addr}", self._handle_device_api)
+        self.app.router.add_post("/v1/storage/roll", self._handle_storage_roll)
+        self.app.router.add_post("/v1/storage/delete", self._handle_storage_delete)
+
+    async def _handle_storage_roll(self, request: web.Request) -> web.Response:
+        try:
+            result = await self.runtime.roll_storage()
+            return web.json_response(result)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_storage_delete(self, request: web.Request) -> web.Response:
+        try:
+            await self.runtime.delete_storage()
+            return web.json_response({"status": "deleted"})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+    def _storage_banner_html(self) -> str:
+        """Return a warning banner HTML+JS block if storage exceeds the size threshold."""
+        stats = self.runtime.stats
+        if not stats.get("storage_over_limit"):
+            return ""
+        total_mb = stats.get("storage_total_bytes", 0) // (1024 * 1024)
+        threshold_mb = stats.get("storage_threshold_mb", 500)
+        return (
+            '<div id="storageBanner" style="'
+            'background:#2a1000;border-bottom:2px solid #7a3010;'
+            'padding:8px 16px;display:flex;align-items:center;gap:12px;'
+            'font-size:11px;flex-shrink:0;">'
+            f'<span style="color:#fbbf24">&#9888; Storage: {total_mb} MB'
+            f' &mdash; threshold is {threshold_mb} MB.</span>'
+            '<span style="color:#888">Roll logs to archive them, or delete to free space.</span>'
+            '<button class="btn" onclick="storageBannerAction(\'roll\')" '
+            'style="border-color:#7a4010;color:#fbbf24">Roll logs</button>'
+            '<button class="btn" onclick="storageBannerAction(\'delete\')" '
+            'style="border-color:#7a1010;color:#f87171">Delete logs</button>'
+            '<span id="storageBannerStatus" style="color:#888;margin-left:4px"></span>'
+            '</div>'
+            '<script>'
+            'async function storageBannerAction(action) {'
+            '  const st = document.getElementById("storageBannerStatus");'
+            '  const msg = action === "delete"'
+            '    ? "Delete ALL logs permanently? This cannot be undone."'
+            '    : "Archive current logs to timestamped backup files and start fresh?";'
+            '  if (!confirm(msg)) return;'
+            '  st.textContent = action === "delete" ? "Deleting\u2026" : "Rolling\u2026";'
+            '  try {'
+            '    const r = await fetch("/v1/storage/" + action, {method: "POST"});'
+            '    const d = await r.json();'
+            '    if (r.ok) {'
+            '      document.getElementById("storageBanner").style.display = "none";'
+            '      if (action === "roll") st.textContent = "Archived to " + (d.sqlite_backup || "backup");'
+            '    } else { st.textContent = "Error: " + (d.error || r.status); }'
+            '  } catch(e) { st.textContent = "Error: " + e; }'
+            '}'
+            '</script>'
+        )
 
     async def _handle_status(self, request: web.Request) -> web.Response:
         return web.json_response(self.runtime.stats)
@@ -212,6 +269,7 @@ button.btn-primary:hover { background: #1e3460; color: #9ab8ff; }
             f'<option value="{s["id"]}">[{s["id"]}] {s["name"] or ""}</option>'
             for s in sessions
         )
+        banner = self._storage_banner_html()
         css = self._base_css()
         html = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>bluTruth · Query</title>
@@ -257,6 +315,7 @@ body {{ overflow-y: auto; }}
     <a href="/device/unknown" style="display:none">Device</a>
   </nav>
 </div>
+{banner}
 <div class="page">
 <div class="filter-bar">
   <label>Source
@@ -401,6 +460,7 @@ runQuery();
             groups_html += header + "".join(_ev_html(e) for e in evs)
 
         name_display = f" ({info['device_name']})" if info.get("device_name") else ""
+        banner = self._storage_banner_html()
         css = self._base_css()
         html = f"""<!doctype html>
 <html><head><meta charset="utf-8">
@@ -448,6 +508,7 @@ document.addEventListener('click', e => {{
     <a href="/query">Query</a>
   </nav>
 </div>
+{banner}
 <div class="page">
 <div class="device-header">
   <h2>{addr}{name_display}</h2>
@@ -472,6 +533,9 @@ document.addEventListener('click', e => {{
         ui_max_rows = int(self.runtime.config.get("ui", "max_rows", default=500))
         ui_refresh_s = int(self.runtime.config.get("ui", "fallback_refresh_seconds", default=5))
         ui_live_default = bool(self.runtime.config.get("ui", "live_mode_default", default=True))
+        banner = self._storage_banner_html()
+        # Banner is ~50px; columns fill remaining viewport height
+        columns_height = "calc(100vh - 90px)" if banner else "calc(100vh - 40px)"
 
         html = f"""<!doctype html>
 <html>
@@ -560,7 +624,7 @@ body {{
 
 .columns {{
     display: flex;
-    height: calc(100vh - 40px);
+    height: {columns_height};
 }}
 
 .column {{
@@ -711,6 +775,8 @@ noscript .fallback-notice {{
         <button onclick="location.reload()">Refresh</button>
     </div>
 </div>
+
+{banner}
 
 <noscript>
 <div class="fallback-notice">

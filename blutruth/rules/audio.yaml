@@ -46,10 +46,7 @@ rules:
         event_type: DBUS_PROP
         conditions:
           interface: org.bluez.MediaTransport1
-      - source: DBUS
-        event_type: DBUS_PROP
-        conditions:
-          interface: org.bluez.MediaTransport1
+        count: 2
     time_window_ms: 5000
     same_device: true
     severity: INFO
@@ -99,10 +96,7 @@ rules:
         event_type: DBUS_PROP
         conditions:
           interface: org.bluez.MediaTransport1
-      - source: DBUS
-        event_type: DBUS_PROP
-        conditions:
-          interface: org.bluez.MediaTransport1
+        count: 2
     time_window_ms: 2000
     same_device: true
     severity: WARN

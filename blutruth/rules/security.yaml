@@ -273,14 +273,7 @@ rules:
     triggers:
       - source: HCI
         event_type: LE_ADV_REPORT
-      - source: HCI
-        event_type: LE_ADV_REPORT
-      - source: HCI
-        event_type: LE_ADV_REPORT
-      - source: HCI
-        event_type: LE_ADV_REPORT
-      - source: HCI
-        event_type: LE_ADV_REPORT
+        count: 5
     time_window_ms: 2000
     same_device: true
     severity: WARN
@@ -291,10 +284,32 @@ rules:
       Random/resolvable private addresses are less concerning than static addresses.
 
   # ---------------------------------------------------------------------------
-  # BIAS NOTE: CVE-2020-10135 detection requires "NOT followed by" trigger
-  # support (a planned future feature in the rule engine). The attack fires when
-  # AUTH_COMPLETE occurs WITHOUT a subsequent ENCRYPT_CHANGE. Until negation
-  # triggers are supported, BIAS detection cannot be expressed as a pattern rule.
-  # Monitor the HCI trace manually: look for AUTH_COMPLETE events with no
-  # subsequent ENCRYPT_CHANGE within 2 seconds on the same handle.
+  # BIAS Attack (CVE-2020-10135) — authentication without encryption
   # ---------------------------------------------------------------------------
+
+  - id: bias_indicator
+    name: "BIAS Attack Indicator"
+    description: >
+      Classic BT authentication completed (AUTH_COMPLETE) but encryption setup
+      (ENCRYPT_CHANGE) did not follow within 2 seconds. The BIAS attack
+      (CVE-2020-10135) exploits this by impersonating a previously paired device:
+      the attacker completes authentication using a reflected challenge but skips
+      re-establishing encryption, allowing role-switching or profile access without
+      a valid link key. On a legitimate connection, ENCRYPT_CHANGE always follows
+      AUTH_COMPLETE within milliseconds. Absence is anomalous.
+    triggers:
+      - source: HCI
+        event_type: AUTH_COMPLETE
+      - source: HCI
+        event_type: ENCRYPT_CHANGE
+        negate: true
+    time_window_ms: 2000
+    same_device: true
+    severity: SUSPICIOUS
+    summary: "BIAS indicator on {device_addr} — auth completed without encryption"
+    action: >
+      Authentication completed but encryption was not established. Disconnect
+      immediately. Do not use this connection for any operation.
+      Re-pair the device — the pairing database entry may be compromised.
+      Check device firmware for CVE-2020-10135 patches.
+      Reference: CVE-2020-10135, NIST SP 800-121r2 section 4.3.

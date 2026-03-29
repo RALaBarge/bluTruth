@@ -1,6 +1,6 @@
 """
 Tests for blutruth.correlation.rules — TriggerSpec, _values_match, Rule.from_dict,
-and basic RuleEngine matching behavior.
+and basic RuleEngine matching behavior (including count and negate triggers).
 """
 from __future__ import annotations
 
@@ -303,6 +303,283 @@ rules:
     pattern_events = [e for e in bus.events if e.event_type == "PATTERN_MATCH"]
     assert len(pattern_events) == 1
     assert pattern_events[0].severity == "ERROR"
+
+
+# ---------------------------------------------------------------------------
+# count trigger
+# ---------------------------------------------------------------------------
+
+def test_rule_from_dict_count_expands_triggers():
+    """count: 3 on one trigger entry should expand to 3 identical TriggerSpec objects."""
+    d = {
+        "id": "count_test",
+        "triggers": [
+            {"event_type": "AUTH_FAILURE", "source": "HCI", "count": 3},
+        ],
+    }
+    rule = Rule.from_dict(d)
+    assert len(rule.triggers) == 3
+    for t in rule.triggers:
+        assert t.event_type == "AUTH_FAILURE"
+        assert t.source == "HCI"
+        assert t.negate is False
+
+
+def test_rule_from_dict_count_one_is_unchanged():
+    d = {
+        "id": "r",
+        "triggers": [{"event_type": "X", "count": 1}],
+    }
+    rule = Rule.from_dict(d)
+    assert len(rule.triggers) == 1
+
+
+def test_rule_from_dict_count_mixed():
+    """count on one trigger, plain on another."""
+    d = {
+        "id": "mixed",
+        "triggers": [
+            {"event_type": "A", "count": 2},
+            {"event_type": "B"},
+        ],
+    }
+    rule = Rule.from_dict(d)
+    assert len(rule.triggers) == 3
+    assert rule.triggers[0].event_type == "A"
+    assert rule.triggers[1].event_type == "A"
+    assert rule.triggers[2].event_type == "B"
+
+
+@pytest.mark.asyncio
+async def test_count_trigger_fires_after_n_events(tmp_path: Path):
+    """Rule with count:3 should fire after the third matching event, not before."""
+    from blutruth.correlation.rules import RuleEngine
+    from blutruth.config import Config
+    from tests.conftest import MockBus
+
+    rule_file = tmp_path / "rules.yaml"
+    rule_file.write_text("""
+rules:
+  - id: auth_loop
+    name: "Auth Loop"
+    triggers:
+      - event_type: AUTH_FAILURE
+        source: HCI
+        count: 3
+    time_window_ms: 5000
+    same_device: true
+    severity: ERROR
+    summary: "Auth loop on {device_addr}"
+    action: "Re-pair"
+""")
+    bus = MockBus()
+    cfg = Config(Path("/tmp/_blutruth_test_nonexistent.yaml"))
+    engine = RuleEngine(bus, cfg)
+    engine.load_rules([rule_file])
+
+    addr = "AA:BB:CC:DD:EE:FF"
+
+    for i in range(2):
+        await engine._process_event(_ev(source="HCI", event_type="AUTH_FAILURE", device_addr=addr))
+        assert len([e for e in bus.events if e.event_type == "PATTERN_MATCH"]) == 0
+
+    # Third event fires the rule
+    await engine._process_event(_ev(source="HCI", event_type="AUTH_FAILURE", device_addr=addr))
+    matches = [e for e in bus.events if e.event_type == "PATTERN_MATCH"]
+    assert len(matches) == 1
+    assert matches[0].severity == "ERROR"
+
+
+@pytest.mark.asyncio
+async def test_count_trigger_different_device_does_not_advance(tmp_path: Path):
+    """Count should not advance when events come from a different device address."""
+    from blutruth.correlation.rules import RuleEngine
+    from blutruth.config import Config
+    from tests.conftest import MockBus
+
+    rule_file = tmp_path / "rules.yaml"
+    rule_file.write_text("""
+rules:
+  - id: count_same_device
+    name: "Count same device"
+    triggers:
+      - event_type: AUTH_FAILURE
+        count: 2
+    time_window_ms: 5000
+    same_device: true
+    severity: WARN
+    summary: "Two failures"
+    action: ""
+""")
+    bus = MockBus()
+    cfg = Config(Path("/tmp/_blutruth_test_nonexistent.yaml"))
+    engine = RuleEngine(bus, cfg)
+    engine.load_rules([rule_file])
+
+    # First event from device A starts a partial
+    await engine._process_event(_ev(event_type="AUTH_FAILURE", device_addr="AA:BB:CC:DD:EE:FF"))
+    # Second event from device B should NOT complete the partial for device A
+    await engine._process_event(_ev(event_type="AUTH_FAILURE", device_addr="11:22:33:44:55:66"))
+    assert len([e for e in bus.events if e.event_type == "PATTERN_MATCH"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# negate trigger
+# ---------------------------------------------------------------------------
+
+def test_rule_from_dict_negate_flag():
+    d = {
+        "id": "bias",
+        "triggers": [
+            {"event_type": "AUTH_COMPLETE", "source": "HCI"},
+            {"event_type": "ENCRYPT_CHANGE", "source": "HCI", "negate": True},
+        ],
+    }
+    rule = Rule.from_dict(d)
+    assert len(rule.triggers) == 2
+    assert rule.triggers[0].negate is False
+    assert rule.triggers[1].negate is True
+
+
+def test_rule_from_dict_negate_ignores_count():
+    """count on a negate trigger should be ignored (always 1)."""
+    d = {
+        "id": "r",
+        "triggers": [
+            {"event_type": "A"},
+            {"event_type": "B", "negate": True, "count": 5},
+        ],
+    }
+    rule = Rule.from_dict(d)
+    assert len(rule.triggers) == 2  # not 6
+    assert rule.triggers[1].negate is True
+
+
+@pytest.mark.asyncio
+async def test_negate_trigger_fires_when_event_absent(tmp_path: Path):
+    """Negate rule fires when the negated event does NOT appear within the window."""
+    from blutruth.correlation.rules import RuleEngine
+    from blutruth.config import Config
+    from tests.conftest import MockBus
+
+    rule_file = tmp_path / "rules.yaml"
+    rule_file.write_text("""
+rules:
+  - id: bias_test
+    name: "BIAS Test"
+    triggers:
+      - event_type: AUTH_COMPLETE
+        source: HCI
+      - event_type: ENCRYPT_CHANGE
+        source: HCI
+        negate: true
+    time_window_ms: 100
+    same_device: true
+    severity: SUSPICIOUS
+    summary: "BIAS on {device_addr}"
+    action: "Disconnect"
+""")
+    bus = MockBus()
+    cfg = Config(Path("/tmp/_blutruth_test_nonexistent.yaml"))
+    engine = RuleEngine(bus, cfg)
+    engine.load_rules([rule_file])
+
+    addr = "AA:BB:CC:DD:EE:FF"
+    await engine._process_event(_ev(source="HCI", event_type="AUTH_COMPLETE", device_addr=addr))
+
+    # No ENCRYPT_CHANGE → should not fire yet
+    assert len([e for e in bus.events if e.event_type == "PATTERN_MATCH"]) == 0
+
+    # Simulate window expiry by backdating the partial
+    for pm in engine._partials[addr]:
+        pm.started_at_mono -= 0.2  # 200ms ago, window is 100ms
+
+    # Expiry pass fires the negate match
+    await engine._expire_old_partials()
+
+    matches = [e for e in bus.events if e.event_type == "PATTERN_MATCH"]
+    assert len(matches) == 1
+    assert matches[0].severity == "SUSPICIOUS"
+
+
+@pytest.mark.asyncio
+async def test_negate_trigger_cancelled_when_event_appears(tmp_path: Path):
+    """Negate rule is cancelled when the negated event DOES appear."""
+    from blutruth.correlation.rules import RuleEngine
+    from blutruth.config import Config
+    from tests.conftest import MockBus
+
+    rule_file = tmp_path / "rules.yaml"
+    rule_file.write_text("""
+rules:
+  - id: bias_cancel
+    name: "BIAS Cancel Test"
+    triggers:
+      - event_type: AUTH_COMPLETE
+        source: HCI
+      - event_type: ENCRYPT_CHANGE
+        source: HCI
+        negate: true
+    time_window_ms: 2000
+    same_device: true
+    severity: SUSPICIOUS
+    summary: "BIAS on {device_addr}"
+    action: "Disconnect"
+""")
+    bus = MockBus()
+    cfg = Config(Path("/tmp/_blutruth_test_nonexistent.yaml"))
+    engine = RuleEngine(bus, cfg)
+    engine.load_rules([rule_file])
+
+    addr = "AA:BB:CC:DD:EE:FF"
+
+    # First trigger: auth complete
+    await engine._process_event(_ev(source="HCI", event_type="AUTH_COMPLETE", device_addr=addr))
+    # Partial should be waiting on negate
+    assert any(pm.waiting_for_negate for pm in engine._partials[addr])
+
+    # Negated event arrives → partial cancelled
+    await engine._process_event(_ev(source="HCI", event_type="ENCRYPT_CHANGE", device_addr=addr))
+    assert len(engine._partials[addr]) == 0
+
+    # No PATTERN_MATCH emitted (normal connection, no anomaly)
+    assert len([e for e in bus.events if e.event_type == "PATTERN_MATCH"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_negate_trigger_same_device_only(tmp_path: Path):
+    """ENCRYPT_CHANGE from a different device should not cancel the BIAS partial."""
+    from blutruth.correlation.rules import RuleEngine
+    from blutruth.config import Config
+    from tests.conftest import MockBus
+
+    rule_file = tmp_path / "rules.yaml"
+    rule_file.write_text("""
+rules:
+  - id: bias_device
+    name: "BIAS device isolation"
+    triggers:
+      - event_type: AUTH_COMPLETE
+      - event_type: ENCRYPT_CHANGE
+        negate: true
+    time_window_ms: 2000
+    same_device: true
+    severity: SUSPICIOUS
+    summary: "BIAS"
+    action: ""
+""")
+    bus = MockBus()
+    cfg = Config(Path("/tmp/_blutruth_test_nonexistent.yaml"))
+    engine = RuleEngine(bus, cfg)
+    engine.load_rules([rule_file])
+
+    victim = "AA:BB:CC:DD:EE:FF"
+    other  = "11:22:33:44:55:66"
+
+    await engine._process_event(_ev(event_type="AUTH_COMPLETE", device_addr=victim))
+    # ENCRYPT_CHANGE from a different device — should NOT cancel victim's partial
+    await engine._process_event(_ev(event_type="ENCRYPT_CHANGE", device_addr=other))
+    assert any(pm.waiting_for_negate for pm in engine._partials[victim])
 
 
 @pytest.mark.asyncio

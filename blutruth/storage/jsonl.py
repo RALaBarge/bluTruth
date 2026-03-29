@@ -44,6 +44,23 @@ class JsonlSink:
             self._fp.write(line)
             self._total_written += 1
 
+    async def roll(self, ts: str) -> Path:
+        """Flush, close, rename current JSONL to a timestamped backup, then reopen fresh."""
+        await self.stop()
+        backup = self.path.with_name(f"{self.path.stem}.{ts}.jsonl")
+        self.path.rename(backup)
+        self._total_written = 0
+        await self.start()
+        return backup
+
+    async def delete(self) -> None:
+        """Close and delete the JSONL file, then reopen fresh."""
+        await self.stop()
+        if self.path.exists():
+            self.path.unlink()
+        self._total_written = 0
+        await self.start()
+
     @property
     def stats(self) -> dict:
         size_bytes = 0

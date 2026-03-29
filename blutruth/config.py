@@ -4,10 +4,6 @@ blutruth.config — YAML configuration with hot reload
 Config is polled for changes every 1s. On change, only affected collectors
 restart; the event bus, storage, and correlation engine continue uninterrupted.
 
-Fields that are PARSED but not yet implemented (reserved for future milestones):
-  storage.retention_days      — Tier 2: periodic DELETE of old events; DB grows forever today
-  correlation.rules_path      — Tier 3: YAML semantic rule-pack; only time-window grouping today
-
 Fields that are fully implemented:
   listen.*                    — host/port for 'serve' command
   storage.sqlite_path / jsonl_path
@@ -17,6 +13,9 @@ Fields that are fully implemented:
   ui.fallback_refresh_seconds — noscript meta-refresh interval
   ui.live_mode_default        — whether SSE auto-connects on page load
   security.local_only         — warns when binding non-loopback with local_only=true
+  storage.retention_days      — periodic DELETE; retention_days=0 disables (default: 30)
+  correlation.rules_path      — user YAML rule packs; overrides built-ins by id
+  storage.size_warn_mb        — startup warning threshold (default: 500)
 
 FUTURE: Replace polling with inotify/watchdog for efficiency.
 FUTURE (Rust port): serde_yaml with notify crate for file watching.
@@ -40,6 +39,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "sqlite_path": "~/.blutruth/events.db",
         "jsonl_path": "~/.blutruth/events.jsonl",
         "retention_days": 30,
+        "size_warn_mb": 500,        # warn at startup if combined storage exceeds this
     },
     "collectors": {
         "hci": {

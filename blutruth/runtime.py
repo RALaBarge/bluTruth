@@ -86,12 +86,24 @@ class Runtime:
         self._config_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._session_id: Optional[int] = None
+        self._storage_over_limit: bool = False
+        self._storage_total_bytes: int = 0
+        self._storage_threshold_mb: int = int(
+            self.config.get("storage", "size_warn_mb", default=500)
+        )
 
     async def start(self) -> None:
         """Start all components in dependency order."""
         # 1. Storage first (must be ready before events flow)
         await self.sqlite.start()
         await self.jsonl.start()
+
+        # Check combined storage size against threshold
+        sqlite_bytes = self.sqlite.path.stat().st_size if self.sqlite.path.exists() else 0
+        jsonl_bytes = self.jsonl.path.stat().st_size if self.jsonl.path.exists() else 0
+        self._storage_total_bytes = sqlite_bytes + jsonl_bytes
+        threshold_bytes = self._storage_threshold_mb * 1024 * 1024
+        self._storage_over_limit = self._storage_total_bytes > threshold_bytes
 
         # 2. Session — create before events start flowing so all events get stamped
         import datetime as _dt
@@ -102,6 +114,26 @@ class Runtime:
 
         # 3. Writer task (drains bus → storage)
         self._writer_task = asyncio.create_task(self._writer_loop())
+
+        # Emit storage size warning now that the writer is running
+        if self._storage_over_limit:
+            total_mb = self._storage_total_bytes // (1024 * 1024)
+            await self.bus.publish(Event.new(
+                source="RUNTIME",
+                severity="WARN",
+                event_type="STORAGE_SIZE_WARN",
+                summary=(
+                    f"Storage size ({total_mb} MB) exceeds {self._storage_threshold_mb} MB threshold "
+                    "— consider rolling logs to archive them or deleting them to free space"
+                ),
+                raw_json={
+                    "sqlite_bytes": sqlite_bytes,
+                    "jsonl_bytes": jsonl_bytes,
+                    "total_bytes": self._storage_total_bytes,
+                    "threshold_mb": self._storage_threshold_mb,
+                },
+                tags=["storage"],
+            ))
 
         # 5. Privilege check
         await self._check_privileges()
@@ -345,6 +377,83 @@ class Runtime:
                             raw_json={"collector": collector.name, "error": str(e)},
                         ))
 
+    async def roll_storage(self) -> dict:
+        """
+        Archive current storage files to timestamped backups and start fresh.
+
+        Pauses the writer, drains remaining events, closes storage, renames files,
+        reopens fresh storage, creates a new session, restarts the writer.
+        """
+        import datetime as _dt
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        if self._writer_task:
+            self._writer_task.cancel()
+            try:
+                await self._writer_task
+            except asyncio.CancelledError:
+                pass
+            self._writer_task = None
+
+        if self._session_id:
+            await self.sqlite.end_session(self._session_id)
+            self._session_id = None
+
+        sqlite_backup = await self.sqlite.roll(ts)
+        jsonl_backup = await self.jsonl.roll(ts)
+
+        self._session_id = await self.sqlite.create_session(
+            f"collect {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()}"
+        )
+        self._storage_over_limit = False
+        self._storage_total_bytes = 0
+        self._writer_task = asyncio.create_task(self._writer_loop())
+
+        await self.bus.publish(Event.new(
+            source="RUNTIME",
+            event_type="STORAGE_ROLLED",
+            summary=f"Storage rolled — archived to {sqlite_backup.name}",
+            raw_json={"sqlite_backup": str(sqlite_backup), "jsonl_backup": str(jsonl_backup)},
+            tags=["storage"],
+        ))
+        return {"sqlite_backup": str(sqlite_backup), "jsonl_backup": str(jsonl_backup)}
+
+    async def delete_storage(self) -> None:
+        """
+        Delete all storage files and start fresh.
+        """
+        import datetime as _dt
+
+        if self._writer_task:
+            self._writer_task.cancel()
+            try:
+                await self._writer_task
+            except asyncio.CancelledError:
+                pass
+            self._writer_task = None
+
+        if self._session_id:
+            await self.sqlite.end_session(self._session_id)
+            self._session_id = None
+
+        await self.sqlite.delete()
+        await self.jsonl.delete()
+
+        self._session_id = await self.sqlite.create_session(
+            f"collect {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()}"
+        )
+        self._storage_over_limit = False
+        self._storage_total_bytes = 0
+        self._writer_task = asyncio.create_task(self._writer_loop())
+
+        await self.bus.publish(Event.new(
+            source="RUNTIME",
+            event_type="STORAGE_DELETED",
+            summary="Storage deleted — all previous logs removed",
+            raw_json={},
+            tags=["storage"],
+        ))
+
     async def _check_privileges(self) -> None:
         """Emit a notice about privilege level and what's available."""
         uid = os.geteuid()
@@ -368,6 +477,9 @@ class Runtime:
             "bus": self.bus.stats,
             "sqlite": self.sqlite.stats,
             "jsonl": self.jsonl.stats,
+            "storage_over_limit": self._storage_over_limit,
+            "storage_total_bytes": self._storage_total_bytes,
+            "storage_threshold_mb": self._storage_threshold_mb,
             "correlation": self.correlation.stats,
             "rules": self.rules.stats,
             "collectors": {

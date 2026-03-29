@@ -14,16 +14,25 @@ Rule file format (YAML):
           event_type: DISCONNECT    # required
           conditions:               # optional key=value checks on raw_json
             reason_code: 8
-        - source: DBUS
-          event_type: DBUS_PROP
-          conditions:
-            key: Connected
-            value: false
+          count: 3                  # optional; expand to N identical triggers (default: 1)
+        - source: HCI
+          event_type: ENCRYPT_CHANGE
+          negate: true              # optional; rule fires if this does NOT occur within window
       time_window_ms: 500           # triggers must all occur within this window
       same_device: true             # all triggers must share device_addr (default: true)
       severity: WARN                # severity of the emitted PATTERN_MATCH event
       summary: "Pattern: {name} on {device_addr}"  # {fields} from first trigger event
       action: "Check RF link quality"
+
+Trigger types:
+  Normal:  rule advances when the event occurs (default)
+  count:N: shorthand for repeating a trigger N times (e.g. count:3 = 3 identical triggers)
+  negate:  rule advances when the event does NOT occur within time_window_ms.
+           At parse time, count triggers are expanded to N identical TriggerSpec entries.
+           A negate trigger CANNOT be trigger[0] (there must be something to wait after).
+           When the engine reaches a negate trigger, it sets waiting_for_negate=True on
+           the partial and waits. If the negated event arrives → partial is cancelled.
+           If time_window_ms elapses → partial advances (and fires if it was the last trigger).
 
 Rule loading order:
   1. Built-in rules from blutruth/rules/*.yaml (shipped with package)
@@ -31,16 +40,6 @@ Rule loading order:
   User rules take precedence: if a user rule has the same id as a built-in,
   the user rule wins.
 
-Pattern matching:
-  The engine maintains a per-device sliding window deque. For each incoming
-  event, it checks if it matches the NEXT expected trigger in any active
-  partial sequence for that device. When all triggers fire within time_window_ms,
-  the rule fires.
-
-  Partial sequences time out after time_window_ms if not completed.
-
-FUTURE: Add 'negate' trigger type (rule fires if pattern does NOT appear).
-FUTURE: Add 'count' trigger type (same event_type N times within window).
 FUTURE: Add 'cross_device' rules (e.g., same name, different addr).
 """
 
@@ -66,6 +65,7 @@ class TriggerSpec:
     event_type: str
     source: Optional[str] = None
     conditions: Dict[str, Any] = field(default_factory=dict)
+    negate: bool = False  # if True: partial advances when this event does NOT appear
 
     def matches(self, ev: Event) -> bool:
         if self.source and ev.source != self.source:
@@ -120,14 +120,17 @@ class Rule:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Rule":
-        triggers = [
-            TriggerSpec(
+        triggers: List[TriggerSpec] = []
+        for t in d.get("triggers", []):
+            spec = TriggerSpec(
                 event_type=t["event_type"],
                 source=t.get("source"),
                 conditions=t.get("conditions", {}),
+                negate=bool(t.get("negate", False)),
             )
-            for t in d.get("triggers", [])
-        ]
+            # count: N expands to N identical TriggerSpec entries (negate ignores count)
+            repeat = 1 if spec.negate else max(1, int(t.get("count", 1)))
+            triggers.extend([spec] * repeat)
         return cls(
             id=d["id"],
             name=d.get("name", d["id"]),
@@ -147,7 +150,8 @@ class PartialMatch:
     rule: Rule
     matched_events: List[Event]
     next_trigger_idx: int
-    started_at_mono: float  # monotonic time in seconds
+    started_at_mono: float          # monotonic time in seconds
+    waiting_for_negate: bool = False  # True when sitting at a negate trigger
 
 
 class RuleEngine:
@@ -224,7 +228,7 @@ class RuleEngine:
             try:
                 ev = await asyncio.wait_for(self._queue.get(), timeout=5.0)
             except asyncio.TimeoutError:
-                self._expire_old_partials()
+                await self._expire_old_partials()
                 continue
             except asyncio.CancelledError:
                 break
@@ -238,22 +242,41 @@ class RuleEngine:
 
     async def _process_event(self, ev: Event) -> None:
         now = time.monotonic()
-
-        # Determine the device key for partials grouping
         device_key = ev.device_addr if ev.device_addr else "_global_"
 
-        # Expire stale partials for this device
-        self._expire_partials_for(device_key, now)
+        # 1. Expire stale partials; negate-triggered ones fire now
+        for pm in self._expire_partials_for(device_key, now):
+            await self._emit_match(pm)
 
-        # Try to advance existing partials
+        # 2. Cancel negate-waiting partials if the negated event arrives
+        updated: List[PartialMatch] = []
+        for pm in self._partials[device_key]:
+            if not pm.waiting_for_negate:
+                updated.append(pm)
+                continue
+            negate_t = pm.rule.triggers[pm.next_trigger_idx]
+            # Enforce same_device: only react to events from the same device
+            if pm.rule.same_device:
+                first_addr = pm.matched_events[0].device_addr if pm.matched_events else None
+                if first_addr and ev.device_addr and first_addr != ev.device_addr:
+                    updated.append(pm)
+                    continue
+            if negate_t.matches(ev):
+                pass  # negated event appeared → cancel (not an anomaly)
+            else:
+                updated.append(pm)
+        self._partials[device_key] = updated
+
+        # 3. Try to advance existing non-negate partials
         completed: List[PartialMatch] = []
         for pm in list(self._partials[device_key]):
+            if pm.waiting_for_negate:
+                continue
             next_t = pm.rule.triggers[pm.next_trigger_idx]
             if not next_t.matches(ev):
                 continue
-            # Check same_device constraint
             if pm.rule.same_device and ev.device_addr:
-                first_addr = pm.matched_events[0].device_addr
+                first_addr = pm.matched_events[0].device_addr if pm.matched_events else None
                 if first_addr and first_addr != ev.device_addr:
                     continue
             pm.matched_events.append(ev)
@@ -261,30 +284,28 @@ class RuleEngine:
             if pm.next_trigger_idx >= len(pm.rule.triggers):
                 completed.append(pm)
                 self._partials[device_key].remove(pm)
+            elif pm.rule.triggers[pm.next_trigger_idx].negate:
+                pm.waiting_for_negate = True
 
-        # Start new partials for rules where this event matches trigger[0]
+        # 4. Start new partials for rules whose trigger[0] matches
         for rule in self.rules:
-            if not rule.triggers:
+            if not rule.triggers or rule.triggers[0].negate:
+                continue  # negate cannot be trigger[0]
+            if not rule.triggers[0].matches(ev):
                 continue
-            if rule.triggers[0].matches(ev):
-                if len(rule.triggers) == 1:
-                    # Single-trigger rule fires immediately
-                    pm = PartialMatch(
-                        rule=rule,
-                        matched_events=[ev],
-                        next_trigger_idx=1,
-                        started_at_mono=now,
-                    )
-                    completed.append(pm)
-                else:
-                    self._partials[device_key].append(PartialMatch(
-                        rule=rule,
-                        matched_events=[ev],
-                        next_trigger_idx=1,
-                        started_at_mono=now,
-                    ))
+            pm = PartialMatch(
+                rule=rule,
+                matched_events=[ev],
+                next_trigger_idx=1,
+                started_at_mono=now,
+            )
+            if len(rule.triggers) == 1:
+                completed.append(pm)
+            else:
+                if rule.triggers[1].negate:
+                    pm.waiting_for_negate = True
+                self._partials[device_key].append(pm)
 
-        # Emit events for completed matches
         for pm in completed:
             await self._emit_match(pm)
 
@@ -338,18 +359,46 @@ class RuleEngine:
             tags=["pattern", rule.id],
         ))
 
-    def _expire_partials_for(self, device_key: str, now: float) -> None:
-        before = self._partials[device_key]
-        after = [
-            pm for pm in before
-            if (now - pm.started_at_mono) * 1000 < pm.rule.time_window_ms * 2
-        ]
-        self._partials[device_key] = after
+    def _expire_partials_for(self, device_key: str, now: float) -> List[PartialMatch]:
+        """
+        Remove stale partials and return any negate-triggered ones that should fire.
 
-    def _expire_old_partials(self) -> None:
+        Negate-waiting partials fire when time_window_ms elapses without the
+        negated event appearing. Normal partials are discarded at 2× the window.
+        """
+        active: List[PartialMatch] = []
+        to_fire: List[PartialMatch] = []
+
+        for pm in self._partials[device_key]:
+            elapsed_ms = (now - pm.started_at_mono) * 1000
+            if pm.waiting_for_negate:
+                if elapsed_ms >= pm.rule.time_window_ms:
+                    # Window expired without negated event → advance past negate trigger
+                    pm.next_trigger_idx += 1
+                    pm.waiting_for_negate = False
+                    if pm.next_trigger_idx >= len(pm.rule.triggers):
+                        to_fire.append(pm)
+                    else:
+                        # More triggers remain; continue (check if next is also negate)
+                        if pm.rule.triggers[pm.next_trigger_idx].negate:
+                            pm.waiting_for_negate = True
+                        active.append(pm)
+                else:
+                    active.append(pm)
+            else:
+                if elapsed_ms < pm.rule.time_window_ms * 2:
+                    active.append(pm)
+                # else: normal expiry, discard silently
+
+        self._partials[device_key] = active
+        return to_fire
+
+    async def _expire_old_partials(self) -> None:
+        """Periodic expiry pass — also fires negate-triggered matches that timed out."""
         now = time.monotonic()
         for key in list(self._partials.keys()):
-            self._expire_partials_for(key, now)
+            for pm in self._expire_partials_for(key, now):
+                await self._emit_match(pm)
 
     @property
     def stats(self) -> dict:
