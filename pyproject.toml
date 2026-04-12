@@ -27,16 +27,17 @@ classifiers = [
     "Topic :: System :: Networking",
     "Topic :: Software :: Monitoring",
 ]
-repository = "https://github.com/RALaBarge/bluTruth"
-documentation = "https://github.com/RALaBarge/bluTruth/blob/main/README.md"
-issues = "https://github.com/RALaBarge/bluTruth/issues"
-
 dependencies = [
     "pyyaml>=6.0",
     "dbus-next>=0.2.3",
     "aiohttp>=3.9",
     "watchfiles>=0.21",
 ]
+
+[project.urls]
+Repository = "https://github.com/RALaBarge/bluTruth"
+Documentation = "https://github.com/RALaBarge/bluTruth/blob/main/README.md"
+Issues = "https://github.com/RALaBarge/bluTruth/issues"
 
 [project.optional-dependencies]
 dev = [
