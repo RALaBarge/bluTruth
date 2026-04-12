@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "blutruth"
-version = "0.1.0"
+version = "0.2.0"
 description = "Bluetooth Stack Diagnostic Platform — unified timeline correlation"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,9 +27,9 @@ classifiers = [
     "Topic :: System :: Networking",
     "Topic :: Software :: Monitoring",
 ]
-repository = "https://github.com/yourusername/blutruth"
-documentation = "https://github.com/yourusername/blutruth/blob/main/README.md"
-issues = "https://github.com/yourusername/blutruth/issues"
+repository = "https://github.com/RALaBarge/bluTruth"
+documentation = "https://github.com/RALaBarge/bluTruth/blob/main/README.md"
+issues = "https://github.com/RALaBarge/bluTruth/issues"
 
 dependencies = [
     "pyyaml>=6.0",
