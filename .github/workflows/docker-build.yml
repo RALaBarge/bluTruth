@@ -2,14 +2,13 @@ name: Docker Build & Push
 
 on:
   push:
-    branches: [main]
+    branches: [main, macos, master]
     tags: ['v*']
   pull_request:
-    branches: [main]
+    branches: [main, macos, master]
 
 env:
   REGISTRY: ghcr.io
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
@@ -43,7 +42,7 @@ jobs:
           fi
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./docker/Dockerfile
