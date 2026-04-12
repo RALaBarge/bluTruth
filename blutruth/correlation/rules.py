@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -54,6 +55,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
+
+logger = logging.getLogger("blutruth.rules")
 
 from blutruth.bus import EventBus
 from blutruth.config import Config
@@ -196,10 +199,11 @@ class RuleEngine:
                     try:
                         rule = Rule.from_dict(rule_dict)
                         loaded[rule.id] = rule  # later files override earlier
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    except Exception as e:
+                        rule_id = rule_dict.get("id", "unknown")
+                        logger.error("Failed to parse rule '%s' in %s: %s", rule_id, p, e)
+            except Exception as e:
+                logger.error("Failed to load rule file %s: %s", p, e)
 
         self.rules = list(loaded.values())
         return len(self.rules)
@@ -306,6 +310,11 @@ class RuleEngine:
                     pm.waiting_for_negate = True
                 self._partials[device_key].append(pm)
 
+        # Cap partials per device to prevent unbounded growth
+        _MAX_PARTIALS_PER_KEY = 200
+        if len(self._partials[device_key]) > _MAX_PARTIALS_PER_KEY:
+            self._partials[device_key] = self._partials[device_key][-_MAX_PARTIALS_PER_KEY:]
+
         for pm in completed:
             await self._emit_match(pm)
 
@@ -394,11 +403,17 @@ class RuleEngine:
         return to_fire
 
     async def _expire_old_partials(self) -> None:
-        """Periodic expiry pass — also fires negate-triggered matches that timed out."""
+        """Periodic expiry pass — also fires negate-triggered matches that timed out.
+
+        Cleans up empty device keys to prevent unbounded dict growth.
+        """
         now = time.monotonic()
         for key in list(self._partials.keys()):
             for pm in self._expire_partials_for(key, now):
                 await self._emit_match(pm)
+            # GC: remove device keys with no active partials
+            if not self._partials[key]:
+                del self._partials[key]
 
     @property
     def stats(self) -> dict:

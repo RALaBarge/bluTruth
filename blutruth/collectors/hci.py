@@ -67,6 +67,21 @@ _HCI_CLASSIFICATION: Dict[str, tuple] = {
     "LE Extended Create Connection":    ("INFO",  "CONNECTION"),
     "Setup Synchronous Connection":     ("INFO",  "AUDIO"),
     "Enhanced Setup Synchronous Connection": ("INFO", "AUDIO"),
+    # CIS/BIS (LE Isochronous — LE Audio)
+    "LE Create CIS":                    ("INFO",  "AUDIO"),
+    "LE Accept CIS Request":            ("INFO",  "AUDIO"),
+    "LE Reject CIS Request":            ("WARN",  "AUDIO"),
+    "LE Create BIG":                    ("INFO",  "AUDIO"),
+    "LE Terminate BIG":                 ("INFO",  "TEARDOWN"),
+    "LE BIG Create Sync":               ("INFO",  "AUDIO"),
+    "LE BIG Terminate Sync":            ("INFO",  "TEARDOWN"),
+    "LE Setup ISO Data Path":           ("INFO",  "AUDIO"),
+    "LE Remove ISO Data Path":          ("INFO",  "TEARDOWN"),
+    "LE Set CIG Parameters":            ("INFO",  "AUDIO"),
+    "LE Remove CIG":                    ("INFO",  "TEARDOWN"),
+    # Read Remote Features
+    "Read Remote Supported Features":   ("INFO",  "HANDSHAKE"),
+    "Read Remote Extended Features":    ("INFO",  "HANDSHAKE"),
 
     # Events
     "Inquiry Complete":                 ("INFO",  "DISCOVERY"),
@@ -91,6 +106,17 @@ _HCI_CLASSIFICATION: Dict[str, tuple] = {
     "LE Extended Advertising Report":   ("DEBUG", "DISCOVERY"),
     "Synchronous Connection Complete":  ("INFO",  "AUDIO"),
     "Synchronous Connection Changed":   ("INFO",  "AUDIO"),
+    # CIS/BIS events
+    "LE CIS Established":               ("INFO",  "AUDIO"),
+    "LE CIS Request":                   ("INFO",  "AUDIO"),
+    "LE Create BIG Complete":           ("INFO",  "AUDIO"),
+    "LE BIG Sync Established":          ("INFO",  "AUDIO"),
+    "LE BIG Sync Lost":                 ("WARN",  "TEARDOWN"),
+    "LE Terminate BIG Complete":        ("INFO",  "TEARDOWN"),
+    "LE BIG Info Advertising Report":   ("DEBUG", "DISCOVERY"),
+    # Remote features events
+    "Read Remote Supported Features Complete": ("INFO", "HANDSHAKE"),
+    "Read Remote Extended Features Complete":  ("INFO", "HANDSHAKE"),
 
     # L2CAP signaling
     "L2CAP: Connection Request":        ("INFO",  "CONNECTION"),
@@ -157,6 +183,39 @@ _KEY_SIZE_RE = re.compile(r"[Kk]ey\s+[Ss]ize:\s*(\d+)")
 
 # IO capability type: "Capability: DisplayYesNo (0x01)"
 _IO_CAP_RE = re.compile(r"^\s+Capability:\s+(.+?)\s*\(0x([0-9a-f]{2})\)", re.MULTILINE | re.I)
+
+# Encryption state: "Encryption: Enabled" / "Encryption: 0x01"
+_ENCRYPT_RE = re.compile(r"^\s+Encryption:\s+(\w+)", re.MULTILINE | re.I)
+
+# LMP Features bitmask: "Features: 0xff 0xfe 0x8f ..." (8 hex bytes) from Read Remote Features
+_LMP_FEATURES_RE = re.compile(
+    r"^\s+Features:\s+((?:0x[0-9a-f]{2}\s*){1,8})", re.MULTILINE | re.I
+)
+
+# LMP features page: "Page: 1" (for extended features)
+_LMP_PAGE_RE = re.compile(r"^\s+Page:\s+(\d+)", re.MULTILINE | re.I)
+
+# SMP IO Capability: "IO Capability: NoInputNoOutput (0x03)"
+_SMP_IO_CAP_RE = re.compile(r"^\s+IO Capability:\s+(\w+)\s*\(0x([0-9a-f]{2})\)", re.MULTILINE | re.I)
+
+# SMP AuthReq: "AuthReq: 0x0d" or "Auth Req: Bonding, MITM, SC"
+_SMP_AUTH_REQ_RE = re.compile(r"^\s+Auth(?:entication)?\s*Req(?:uirements?)?:\s+0x([0-9a-f]{2})", re.MULTILINE | re.I)
+
+# SMP Max Key Size: "Max Key Size: 16"
+_SMP_MAX_KEY_RE = re.compile(r"^\s+Max (?:Encryption )?Key Size:\s+(\d+)", re.MULTILINE | re.I)
+
+# Number of Completed Packets: "Handle: 256" "Num Completed: 5"
+_NUM_COMPLETED_RE = re.compile(r"^\s+Num Completed:\s+(\d+)", re.MULTILINE | re.I)
+
+# CIS/BIS parameters: "CIG ID: 0x01" "CIS ID: 0x00" "BIG Handle: 0x01"
+_CIG_ID_RE = re.compile(r"^\s+CIG ID:\s+0x([0-9a-f]+)", re.MULTILINE | re.I)
+_CIS_ID_RE = re.compile(r"^\s+CIS ID:\s+0x([0-9a-f]+)", re.MULTILINE | re.I)
+_BIG_HANDLE_RE = re.compile(r"^\s+BIG Handle:\s+0x([0-9a-f]+)", re.MULTILINE | re.I)
+_SDU_INTERVAL_RE = re.compile(r"^\s+SDU Interval[^:]*:\s+(\d+)\s*us", re.MULTILINE | re.I)
+_ISO_INTERVAL_RE = re.compile(r"^\s+ISO Interval:\s+(\d+)", re.MULTILINE | re.I)
+
+# SCO parameters: "Air Coding Format: CVSD" or "Codec: mSBC"
+_SCO_CODEC_RE = re.compile(r"^\s+(?:Air Coding Format|Codec):\s+(\w+)", re.MULTILINE | re.I)
 
 # Device address extraction
 _ADDR_RE = re.compile(r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})")
@@ -418,6 +477,93 @@ class HciCollector(Collector):
         if io_cap_m:
             io_capability = io_cap_m.group(1).strip()
 
+        # Extract encryption state (ON/OFF) from Encryption Change events
+        encryption_enabled = None
+        if "Encryption Change" in header or "Encryption Key Refresh" in header:
+            enc_m = _ENCRYPT_RE.search(full_text)
+            if enc_m:
+                val = enc_m.group(1).lower()
+                encryption_enabled = val in ("enabled", "0x01", "0x02", "1", "2")
+
+        # Extract LMP features from Read Remote Features Complete
+        lmp_features = None
+        lmp_page = 0
+        if "Remote" in header and "Features Complete" in header:
+            feat_m = _LMP_FEATURES_RE.search(full_text)
+            if feat_m:
+                hex_bytes = feat_m.group(1).strip().split()
+                # Convert bytes to a single int (little-endian feature bitmap)
+                feat_int = 0
+                for i, hb in enumerate(hex_bytes):
+                    feat_int |= int(hb, 16) << (i * 8)
+                page_m = _LMP_PAGE_RE.search(full_text)
+                if page_m:
+                    lmp_page = int(page_m.group(1))
+                try:
+                    from blutruth.enrichment.lmp_features import decode_lmp_features
+                    lmp_features = decode_lmp_features(feat_int, lmp_page)
+                except ImportError:
+                    lmp_features = [f"0x{feat_int:016x}"]
+
+        # Extract SMP pairing parameters
+        smp_io_cap = None
+        smp_auth_req = None
+        smp_max_key = None
+        if "SMP: Pairing" in header:
+            smp_io_m = _SMP_IO_CAP_RE.search(full_text)
+            if smp_io_m:
+                smp_io_cap = smp_io_m.group(1).strip()
+            auth_m = _SMP_AUTH_REQ_RE.search(full_text)
+            if auth_m:
+                smp_auth_req = int(auth_m.group(1), 16)
+            key_m = _SMP_MAX_KEY_RE.search(full_text)
+            if key_m:
+                smp_max_key = int(key_m.group(1))
+            # Enrich with decoded flags
+            if smp_auth_req is not None:
+                try:
+                    from blutruth.enrichment.smp_features import decode_auth_req
+                    smp_auth_flags = decode_auth_req(smp_auth_req)
+                except ImportError:
+                    smp_auth_flags = None
+
+        # Extract ACL completed packet counts for bandwidth tracking
+        num_completed = None
+        if "Number of Completed Packets" in header:
+            nc_m = _NUM_COMPLETED_RE.search(full_text)
+            if nc_m:
+                num_completed = int(nc_m.group(1))
+
+        # Extract CIS/BIS isochronous parameters
+        cig_id = None
+        cis_id = None
+        big_handle = None
+        sdu_interval = None
+        iso_interval = None
+        if any(kw in header for kw in ("CIS", "BIG", "ISO")):
+            m = _CIG_ID_RE.search(full_text)
+            if m:
+                cig_id = int(m.group(1), 16)
+            m = _CIS_ID_RE.search(full_text)
+            if m:
+                cis_id = int(m.group(1), 16)
+            m = _BIG_HANDLE_RE.search(full_text)
+            if m:
+                big_handle = int(m.group(1), 16)
+            m = _SDU_INTERVAL_RE.search(full_text)
+            if m:
+                sdu_interval = int(m.group(1))
+            m = _ISO_INTERVAL_RE.search(full_text)
+            if m:
+                iso_interval = int(m.group(1))
+
+        # Extract SCO codec from Synchronous Connection events
+        sco_codec = None
+        if "Synchronous Connection" in header:
+            sco_m = _SCO_CODEC_RE.search(full_text)
+            if sco_m:
+                sco_codec = sco_m.group(1).strip()
+
         # Direction arrow for summary
         dir_label = {"<": "\u2192", ">": "\u2190", "=": "=", "@": "@"}.get(direction, "?")
         summary = f"{dir_label} {header}"[:200]
@@ -440,6 +586,33 @@ class HciCollector(Collector):
                 raw_json["knob_risk"] = "HIGH" if key_size < 7 else "POSSIBLE"
         if io_capability is not None:
             raw_json["io_capability"] = io_capability
+        if encryption_enabled is not None:
+            raw_json["encryption_enabled"] = encryption_enabled
+        if lmp_features is not None:
+            raw_json["lmp_features"] = lmp_features
+            raw_json["lmp_page"] = lmp_page
+        if smp_io_cap is not None:
+            raw_json["smp_io_capability"] = smp_io_cap
+        if smp_auth_req is not None:
+            raw_json["smp_auth_req"] = f"0x{smp_auth_req:02X}"
+            if smp_auth_flags:
+                raw_json["smp_auth_flags"] = smp_auth_flags
+        if smp_max_key is not None:
+            raw_json["smp_max_key_size"] = smp_max_key
+        if num_completed is not None:
+            raw_json["num_completed_packets"] = num_completed
+        if cig_id is not None:
+            raw_json["cig_id"] = cig_id
+        if cis_id is not None:
+            raw_json["cis_id"] = cis_id
+        if big_handle is not None:
+            raw_json["big_handle"] = big_handle
+        if sdu_interval is not None:
+            raw_json["sdu_interval_us"] = sdu_interval
+        if iso_interval is not None:
+            raw_json["iso_interval"] = iso_interval
+        if sco_codec is not None:
+            raw_json["sco_codec"] = sco_codec
 
         await self.bus.publish(Event.new(
             source="HCI",
@@ -498,6 +671,30 @@ class HciCollector(Collector):
             return "SMP_PAIRING"
         if "hardware error" in h:
             return "HCI_HARDWARE_ERROR"
+        # CIS/BIS isochronous
+        if "cis established" in h:
+            return "CIS_ESTABLISHED"
+        if "cis request" in h:
+            return "CIS_REQUEST"
+        if "create big complete" in h:
+            return "BIG_CREATED"
+        if "big sync established" in h:
+            return "BIG_SYNC"
+        if "big sync lost" in h:
+            return "BIG_SYNC_LOST"
+        if "terminate big" in h:
+            return "BIG_TERMINATED"
+        # SCO connection events
+        if "synchronous connection complete" in h:
+            return "SCO_CONNECT"
+        if "synchronous connection changed" in h:
+            return "SCO_CHANGED"
+        # Remote features
+        if "remote" in h and "features complete" in h:
+            return "REMOTE_FEATURES"
+        # Number of completed packets (ACL bandwidth)
+        if "number of completed packets" in h:
+            return "ACL_COMPLETED"
 
         # Direction-based fallbacks
         if direction == "=":

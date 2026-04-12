@@ -459,12 +459,12 @@ runQuery();
                 header = f'<div class="group-header">Group #{key} &mdash; {t0} &mdash; {len(evs)} events</div>'
             groups_html += header + "".join(_ev_html(e) for e in evs)
 
-        name_display = f" ({info['device_name']})" if info.get("device_name") else ""
+        name_display = f" ({_esc(info['device_name'])})" if info.get("device_name") else ""
         banner = self._storage_banner_html()
         css = self._base_css()
         html = f"""<!doctype html>
 <html><head><meta charset="utf-8">
-<title>bluTruth · {addr}</title>
+<title>bluTruth · {_esc(addr)}</title>
 <style>
 {css}
 body {{ overflow-y: auto; }}
@@ -511,12 +511,12 @@ document.addEventListener('click', e => {{
 {banner}
 <div class="page">
 <div class="device-header">
-  <h2>{addr}{name_display}</h2>
+  <h2>{_esc(addr)}{name_display}</h2>
   <div class="device-meta">
     <span><strong>Events:</strong> {info['event_count']}</span>
     <span><strong>First seen:</strong> {(info['first_seen'] or '')[:19]}</span>
     <span><strong>Last seen:</strong> {(info['last_seen'] or '')[:19]}</span>
-    <span><a href="/query?device={addr}">Filter in query panel →</a></span>
+    <span><a href="/query?device={_esc(addr)}">Filter in query panel →</a></span>
   </div>
 </div>
 {groups_html if groups_html else '<p style="color:#555;padding:20px">No events.</p>'}

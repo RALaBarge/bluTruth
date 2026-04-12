@@ -7,7 +7,7 @@ events to the shared event bus.
 Collectors (by stack layer, top to bottom):
   BleSnifferCollector   — BLE air-level packets (nRF Sniffer / btlejack) [MOCK until hardware]
   UbertoothCollector    — Classic BT air-level frames (Ubertooth One) [MOCK until hardware]
-  EbpfCollector         — Kernel tracepoints via eBPF [MOCK until implemented]
+  EbpfCollector         — Kernel BT tracepoints via eBPF (bcc/bpftrace, requires root)
   KernelDriverCollector — Driver layer: dmesg + ftrace + module state
   SysfsCollector        — Adapter state + rfkill via /sys/class/bluetooth
   UdevCollector         — Bluetooth hotplug events via udevadm monitor
@@ -18,6 +18,7 @@ Collectors (by stack layer, top to bottom):
   PipewireCollector     — Audio pipeline monitor (pw-dump / pactl fallback)
   L2pingCollector       — Active L2CAP RTT monitor via l2ping
   BatteryCollector      — GATT Battery Service via org.bluez.Battery1
+  GattCollector         — GATT service/characteristic discovery via D-Bus introspection
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ BleSnifferCollector   = None
 EbpfCollector         = None
 L2pingCollector       = None
 BatteryCollector      = None
+GattCollector         = None
 
 try:
     from .mgmt_api import MgmtApiCollector          # type: ignore[assignment]
@@ -89,6 +91,11 @@ try:
 except Exception:
     pass
 
+try:
+    from .gatt import GattCollector                 # type: ignore[assignment]
+except Exception:
+    pass
+
 __all__ = [
     "Collector",
     "HciCollector",
@@ -104,4 +111,5 @@ __all__ = [
     "EbpfCollector",
     "L2pingCollector",
     "BatteryCollector",
+    "GattCollector",
 ]

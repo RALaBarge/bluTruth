@@ -98,11 +98,13 @@ class CorrelationEngine:
         window_ms = self.config.get("correlation", "time_window_ms", default=100)
         window_us = window_ms * 1000
 
-        # Query recent events that haven't been correlated yet
-        # Look back 5 seconds to catch events from the last few passes
+        # Query recent events that haven't been correlated yet.
+        # Overlap by 2× the correlation window to catch out-of-order events
+        # that arrived after the watermark advanced past their timestamp.
         lookback_us = 5_000_000
+        overlap_us = window_us * 2
         now_us = Event._boot_us()
-        start_us = max(self._last_processed_us, now_us - lookback_us)
+        start_us = max(self._last_processed_us - overlap_us, now_us - lookback_us)
 
         events = await self.sqlite.query_window(start_us, now_us)
         if not events:

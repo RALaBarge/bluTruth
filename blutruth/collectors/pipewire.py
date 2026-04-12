@@ -122,7 +122,50 @@ def _extract_bt_props(obj: dict) -> Dict[str, Any]:
             if section in params:
                 result[f"param_{section}"] = params[section]
 
+    # Extract xrun (buffer underrun/overrun) counters from node driver info
+    if "state" in info:
+        result["state"] = info["state"]
+    error = info.get("error")
+    if error:
+        result["error"] = error
+
     return result
+
+
+def _check_xrun(obj: dict) -> Optional[Dict[str, Any]]:
+    """Check for xrun indicators in PipeWire node state.
+
+    PipeWire exposes xruns via:
+    - info.props["clock.xrun-count"] — cumulative xrun counter
+    - info.error containing "xrun" text
+    - Driver info with xrun stats
+    """
+    info = obj.get("info", {})
+    props = info.get("props", {})
+
+    xrun_count = props.get("clock.xrun-count")
+    if xrun_count is not None:
+        try:
+            xrun_count = int(xrun_count)
+        except (TypeError, ValueError):
+            xrun_count = None
+
+    error = info.get("error", "")
+    has_xrun_error = "xrun" in str(error).lower() if error else False
+
+    # Check driver timing info
+    driver = info.get("driver", {})
+    driver_xruns = None
+    if isinstance(driver, dict):
+        driver_xruns = driver.get("xrun-count")
+
+    if xrun_count or has_xrun_error or driver_xruns:
+        return {
+            "xrun_count": xrun_count,
+            "xrun_error": error if has_xrun_error else None,
+            "driver_xruns": driver_xruns,
+        }
+    return None
 
 
 def _classify_pw_change(obj: dict, change_type: str) -> tuple:
@@ -325,6 +368,37 @@ class PipewireCollector(Collector):
                             device_addr = _normalize_addr(m.group(1))
                             break
 
+            # Enrich codec info if available
+            codec_info = None
+            codec = bt_props.get("bluez5.codec", bt_props.get("bluetooth.codec", ""))
+            if codec:
+                codec_info = {"codec": codec}
+                rate = bt_props.get("audio.rate")
+                fmt = bt_props.get("audio.format")
+                channels = bt_props.get("audio.channels")
+                if rate:
+                    codec_info["sample_rate"] = rate
+                if fmt:
+                    codec_info["format"] = fmt
+                if channels:
+                    codec_info["channels"] = channels
+                try:
+                    from blutruth.enrichment.a2dp_codecs import codec_quality_rank
+                    rank = codec_quality_rank(codec)
+                    if rank > 0:
+                        codec_info["quality_rank"] = rank
+                except ImportError:
+                    pass
+
+            raw = {
+                "pw_id": obj_id,
+                "pw_type": obj.get("type", ""),
+                "change_type": change_type,
+                "bt_props": bt_props,
+            }
+            if codec_info:
+                raw["codec_info"] = codec_info
+
             await self.bus.publish(Event.new(
                 source="PIPEWIRE",
                 severity=severity,
@@ -332,15 +406,42 @@ class PipewireCollector(Collector):
                 event_type=f"PW_{change_type.upper()}",
                 device_addr=device_addr,
                 summary=summary,
-                raw_json={
-                    "pw_id": obj_id,
-                    "pw_type": obj.get("type", ""),
-                    "change_type": change_type,
-                    "bt_props": bt_props,
-                },
+                raw_json=raw,
                 source_version=self.source_version_tag,
                 parser_version=f"pipewire-parser-{self.version}",
             ))
+
+            # Check for xrun (buffer underrun/overrun)
+            xrun = _check_xrun(obj)
+            if xrun:
+                prev = self._known_bt_nodes.get(obj_id)
+                prev_count = 0
+                if prev:
+                    prev_props = prev.get("info", {}).get("props", {})
+                    try:
+                        prev_count = int(prev_props.get("clock.xrun-count", 0))
+                    except (TypeError, ValueError):
+                        prev_count = 0
+                cur_count = xrun.get("xrun_count") or 0
+                # Only emit if count increased (avoid re-emitting stale counts)
+                if cur_count > prev_count or xrun.get("xrun_error"):
+                    xrun_props = _extract_bt_props(obj)
+                    node_desc = xrun_props.get("node.description", xrun_props.get("node.name", ""))
+                    await self.bus.publish(Event.new(
+                        source="PIPEWIRE",
+                        severity="WARN",
+                        stage="AUDIO",
+                        event_type="PW_XRUN",
+                        device_addr=device_addr,
+                        summary=f"Buffer xrun on {node_desc}: count={cur_count} (+{cur_count - prev_count})",
+                        raw_json={
+                            "pw_id": obj_id,
+                            "xrun": xrun,
+                            "bt_props": xrun_props,
+                        },
+                        source_version=self.source_version_tag,
+                        parser_version=f"pipewire-parser-{self.version}",
+                    ))
 
             self._known_bt_nodes[obj_id] = obj
 

@@ -24,10 +24,13 @@ FUTURE (Rust port): serde_yaml with notify crate for file watching.
 from __future__ import annotations
 
 import copy
+import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
+
+logger = logging.getLogger("blutruth.config")
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -87,8 +90,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "mock_data": False,
         },
         "ebpf": {
-            "enabled": True,    # requires root + CAP_BPF — skipped gracefully if non-root
-            "mock_data": False,
+            "enabled": True,    # requires root — gracefully skips if non-root
+            "mock_data": False,  # set True to emit synthetic events for testing without root
         },
         "l2ping": {
             "enabled": True,    # no root — active RTT measurement
@@ -178,6 +181,7 @@ class Config:
         self._prev_collectors = copy.deepcopy(self.data.get("collectors"))
         self.data = _expand_paths(_deep_merge(DEFAULT_CONFIG, raw))
         self._mtime = mtime
+        self.validate()
         return True
 
     def collectors_changed(self) -> bool:
@@ -185,6 +189,44 @@ class Config:
         if self._prev_collectors is None:
             return False
         return self._prev_collectors != self.data.get("collectors")
+
+    def validate(self) -> List[str]:
+        """Validate config values. Returns list of warning messages (empty = OK)."""
+        warnings = []
+        d = self.data
+
+        # Numeric ranges
+        tw = d.get("correlation", {}).get("time_window_ms")
+        if tw is not None and (not isinstance(tw, (int, float)) or tw <= 0):
+            warnings.append(f"correlation.time_window_ms must be positive, got {tw!r}")
+        bi = d.get("correlation", {}).get("batch_interval_s")
+        if bi is not None and (not isinstance(bi, (int, float)) or bi <= 0):
+            warnings.append(f"correlation.batch_interval_s must be positive, got {bi!r}")
+        port = d.get("listen", {}).get("port")
+        if port is not None and (not isinstance(port, int) or port < 1 or port > 65535):
+            warnings.append(f"listen.port must be 1-65535, got {port!r}")
+        rd = d.get("storage", {}).get("retention_days")
+        if rd is not None and (not isinstance(rd, (int, float)) or rd < 0):
+            warnings.append(f"storage.retention_days must be >= 0, got {rd!r}")
+        sw = d.get("storage", {}).get("size_warn_mb")
+        if sw is not None and (not isinstance(sw, (int, float)) or sw <= 0):
+            warnings.append(f"storage.size_warn_mb must be positive, got {sw!r}")
+
+        # Collector-specific
+        collectors = d.get("collectors", {})
+        for name, cfg in collectors.items():
+            if not isinstance(cfg, dict):
+                continue
+            for key in ("poll_s", "poll_interval_s", "sysfs_poll_s", "module_poll_s",
+                        "ping_timeout_s"):
+                val = cfg.get(key)
+                if val is not None and (not isinstance(val, (int, float)) or val <= 0):
+                    warnings.append(f"collectors.{name}.{key} must be positive, got {val!r}")
+
+        for w in warnings:
+            logger.warning("Config validation: %s", w)
+
+        return warnings
 
     def get(self, *keys: str, default: Any = None) -> Any:
         """Dot-path access: cfg.get("collectors", "hci", "enabled")"""

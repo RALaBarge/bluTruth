@@ -31,6 +31,7 @@ from blutruth.collectors import (
     EbpfCollector,
     L2pingCollector,
     BatteryCollector,
+    GattCollector,
 )
 from blutruth.config import Config
 from blutruth.correlation.engine import CorrelationEngine
@@ -157,6 +158,7 @@ class Runtime:
             EbpfCollector,
             L2pingCollector,
             BatteryCollector,
+            GattCollector,
         )
         for cls in _optional:
             if cls is not None:
@@ -289,26 +291,44 @@ class Runtime:
         await self.jsonl.stop()
 
     async def _writer_loop(self) -> None:
-        """Drain the event bus into both storage sinks."""
+        """Drain the event bus into both storage sinks.
+
+        Uses _stop_event instead of task cancellation to avoid killing
+        a write mid-flight. On stop, drains remaining queued events so
+        both sinks get every event.
+        """
         queue = await self.bus.subscribe(max_queue=10000)
         try:
-            while True:
-                event = await queue.get()
+            while not self._stop_event.is_set():
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    break
                 # Write to both sinks concurrently
-                await asyncio.gather(
+                results = await asyncio.gather(
                     self.sqlite.write(event),
                     self.jsonl.write(event),
                     return_exceptions=True,
                 )
-        except asyncio.CancelledError:
+                for r in results:
+                    if isinstance(r, Exception):
+                        # Log but don't crash — best-effort storage
+                        pass
             # Drain remaining events before exit
             while not queue.empty():
                 try:
                     event = queue.get_nowait()
-                    await self.sqlite.write(event)
-                    await self.jsonl.write(event)
+                    await asyncio.gather(
+                        self.sqlite.write(event),
+                        self.jsonl.write(event),
+                        return_exceptions=True,
+                    )
                 except asyncio.QueueEmpty:
                     break
+        except asyncio.CancelledError:
+            pass
         finally:
             await self.bus.unsubscribe(queue)
 

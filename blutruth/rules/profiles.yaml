@@ -1,0 +1,244 @@
+# blutruth/rules/profiles.yaml — Bluetooth profile lifecycle pattern rules
+#
+# Tracks A2DP, HFP, and AVRCP profile state transitions and detects
+# anomalous lifecycle patterns. These profiles are the application-layer
+# protocols that ride on top of L2CAP/RFCOMM connections.
+#
+# Profile events come from two sources:
+#   D-Bus (DBUS_PROP/DBUS_SIG): BlueZ exposes profile state via org.bluez
+#     - MediaTransport1.State: "idle" | "pending" | "active"
+#     - Device1.Connected, Device1.ServicesResolved
+#     - InterfacesAdded/Removed for profile interfaces
+#   Daemon logs (LOG): bluetoothd logs profile connect/disconnect at INFO level
+#
+# A2DP lifecycle:   connect → services resolved → transport acquired → active → idle → disconnect
+# HFP lifecycle:    connect → services resolved → SCO setup → active → SCO teardown → disconnect
+# AVRCP lifecycle:  connect → services resolved → player registered → playing → stopped → disconnect
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # A2DP profile lifecycle
+  # ---------------------------------------------------------------------------
+
+  - id: a2dp_transport_stuck_pending
+    name: "A2DP Transport Stuck in Pending"
+    description: >
+      A2DP MediaTransport entered 'pending' state but never reached 'active'.
+      The pending state means bluetoothd has acquired the transport file descriptor
+      but PipeWire/PulseAudio hasn't started streaming yet. Staying in pending
+      for more than 10s usually indicates the audio daemon failed to open the
+      transport — PipeWire crash, wrong sink routing, or a SEP (Stream End Point)
+      negotiation failure where the remote device rejected the configuration.
+    triggers:
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          interface: org.bluez.MediaTransport1
+          changed.State: pending
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          interface: org.bluez.MediaTransport1
+          changed.State: active
+        negate: true
+    time_window_ms: 10000
+    same_device: true
+    severity: WARN
+    summary: "A2DP transport stuck pending on {device_addr} — audio daemon may have failed"
+    action: >
+      Check PipeWire status: systemctl --user status pipewire
+      Check if correct audio sink is selected: wpctl status
+      Restart PipeWire: systemctl --user restart pipewire
+      If recurring, check bluetoothd logs for SEP negotiation errors.
+
+  - id: a2dp_no_transport_after_connect
+    name: "A2DP Device Connected Without Transport"
+    description: >
+      Device connected and resolved services, but no A2DP MediaTransport was
+      created within 15 seconds. The device may advertise A2DP but the profile
+      connection failed — bluetoothd's SDP record didn't match, the A2DP
+      profile was disabled in config, or the device only supports A2DP sink
+      (not source) and bluetoothd tried the wrong direction.
+    triggers:
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          interface: org.bluez.Device1
+          changed.ServicesResolved: true
+      - source: DBUS
+        event_type: DBUS_SIG
+        conditions:
+          interfaces: org.bluez.MediaTransport1
+        negate: true
+    time_window_ms: 15000
+    same_device: true
+    severity: INFO
+    summary: "No A2DP transport on {device_addr} after connect — profile may be unsupported"
+    action: >
+      Check if device supports A2DP: bluetoothctl info <addr> (look for UUID: Audio Sink/Source).
+      If A2DP is listed but no transport, check bluetoothd logs for profile connection errors.
+      Verify PipeWire bluetooth module is loaded: pactl list modules | grep bluetooth
+
+  - id: a2dp_transport_rapid_cycle
+    name: "A2DP Transport Rapid State Cycling"
+    description: >
+      A2DP transport state changed 4+ times within 5 seconds. Normal operation
+      is idle→pending→active on play, active→idle on pause. Rapid cycling
+      indicates the transport is being repeatedly acquired and released —
+      usually a fight between PipeWire and PulseAudio (both trying to manage
+      the same transport), or a buggy audio application rapidly seeking.
+    triggers:
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          interface: org.bluez.MediaTransport1
+        count: 4
+    time_window_ms: 5000
+    same_device: true
+    severity: WARN
+    summary: "A2DP transport cycling rapidly on {device_addr} — transport contention"
+    action: >
+      Check if both PipeWire and PulseAudio are running (they conflict):
+        ps aux | grep -E 'pipewire|pulseaudio'
+      Only one audio daemon should manage Bluetooth transports.
+      Also check for audio applications rapidly pausing/playing.
+
+  # ---------------------------------------------------------------------------
+  # HFP profile lifecycle
+  # ---------------------------------------------------------------------------
+
+  - id: hfp_sco_setup_timeout
+    name: "HFP SCO Setup Timeout"
+    description: >
+      Device connected with HFP profile but SCO (voice) connection was not
+      established within 10 seconds of an expected voice event. HFP needs
+      a separate SCO link for voice data — if the SCO setup fails, the HFP
+      control channel works (call signaling) but no voice audio is heard.
+      Common cause: local adapter doesn't support mSBC and device requires it.
+    triggers:
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          interface: org.bluez.Device1
+          changed.ServicesResolved: true
+      - source: HCI
+        event_type: SCO_CONNECT
+        negate: true
+    time_window_ms: 10000
+    same_device: true
+    severity: WARN
+    summary: "No SCO link on {device_addr} after HFP connect — voice may not work"
+    action: >
+      SCO voice link not established. Check if adapter supports mSBC:
+        btmgmt info | grep -i sco
+      Some adapters need --compat flag removed from bluetoothd to enable wideband speech.
+      For USB adapters: check if ALT setting 6 (for mSBC) is available:
+        cat /sys/kernel/debug/usb/devices | grep -A5 <adapter>
+
+  - id: hfp_sco_repeated_failure
+    name: "HFP SCO Connection Failures"
+    description: >
+      Multiple SCO connection failures in sequence. Each failure means a voice
+      call attempt failed to get audio working. Indicates a persistent codec
+      or controller issue — not transient RF.
+    triggers:
+      - source: HCI
+        event_type: SCO_CONNECT_FAILED
+        count: 2
+    time_window_ms: 30000
+    same_device: true
+    severity: ERROR
+    summary: "Repeated SCO failures on {device_addr} — voice calls broken"
+    action: >
+      Persistent SCO failure. Try:
+      (1) Disable wideband speech: set WBS=false in /etc/bluetooth/main.conf
+      (2) Check USB ALT settings for SCO support
+      (3) Power cycle the Bluetooth adapter: rfkill block bluetooth && rfkill unblock bluetooth
+
+  # ---------------------------------------------------------------------------
+  # AVRCP profile lifecycle
+  # ---------------------------------------------------------------------------
+
+  - id: avrcp_player_not_registered
+    name: "AVRCP Player Not Registered"
+    description: >
+      A2DP transport is active (audio streaming) but no MediaPlayer1 interface
+      appeared on D-Bus. Without AVRCP player registration, the remote device
+      can't send play/pause/skip commands — volume buttons and media controls
+      on BT headphones won't work. Usually means the audio application isn't
+      registering an MPRIS player with bluetoothd.
+    triggers:
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          interface: org.bluez.MediaTransport1
+          changed.State: active
+      - source: DBUS
+        event_type: DBUS_SIG
+        conditions:
+          interfaces: org.bluez.MediaPlayer1
+        negate: true
+    time_window_ms: 5000
+    same_device: false
+    severity: INFO
+    summary: "No AVRCP player registered — remote media controls may not work"
+    action: >
+      Check if your media player supports MPRIS2 (most do: Firefox, Chromium,
+      VLC, Spotify). MPRIS2 players auto-register with bluetoothd for AVRCP.
+      If using a custom app, implement org.mpris.MediaPlayer2 D-Bus interface.
+
+  # ---------------------------------------------------------------------------
+  # Cross-profile patterns
+  # ---------------------------------------------------------------------------
+
+  - id: profile_connect_without_services
+    name: "Profile Activity Before Services Resolved"
+    description: >
+      Profile-level D-Bus activity (MediaTransport, MediaPlayer, or Battery)
+      appeared before ServicesResolved=true. This is a BlueZ race condition
+      that can cause profile connection failures — the profile tries to connect
+      before GATT/SDP discovery completes.
+    triggers:
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          interface: org.bluez.MediaTransport1
+      - source: DBUS
+        event_type: DBUS_PROP
+        conditions:
+          interface: org.bluez.Device1
+          changed.ServicesResolved: true
+    time_window_ms: 2000
+    same_device: true
+    severity: WARN
+    summary: "Profile activity before services resolved on {device_addr} — race condition"
+    action: >
+      BlueZ race condition: profile connected before service discovery finished.
+      Usually self-resolves on retry. If persistent, check bluetoothd version
+      (fixed in BlueZ 5.65+). Workaround: add a connect delay in your application.
+
+  - id: all_profiles_disconnected
+    name: "All Profiles Disconnected (Device Still Connected)"
+    description: >
+      All profile interfaces (MediaTransport1, MediaPlayer1) were removed but
+      Device1.Connected is still true. The device is connected at the ACL level
+      but has no active profiles — a zombie connection consuming resources.
+      May auto-timeout via BlueZ idle disconnect, but wastes connection slots
+      until then.
+    triggers:
+      - source: DBUS
+        event_type: DBUS_SIG
+        conditions:
+          interfaces: org.bluez.MediaTransport1
+      - source: HCI
+        event_type: DISCONNECT
+        negate: true
+    time_window_ms: 30000
+    same_device: true
+    severity: INFO
+    summary: "Zombie connection on {device_addr} — profiles removed but ACL still up"
+    action: >
+      Device has no active profiles but is still connected. BlueZ will typically
+      disconnect after idle timeout (default 180s). To force: bluetoothctl disconnect <addr>.
+      If recurring, the device may have a buggy reconnect loop.

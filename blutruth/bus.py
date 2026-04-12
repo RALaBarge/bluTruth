@@ -12,9 +12,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from typing import List
 
 from blutruth.events import Event
+
+logger = logging.getLogger("blutruth.bus")
+
+# Warn every N drops (not every single one — would flood logs)
+_DROP_WARN_INTERVAL = 100
 
 
 class EventBus:
@@ -25,6 +31,7 @@ class EventBus:
         self._lock = asyncio.Lock()
         self._total_published: int = 0
         self._total_dropped: int = 0
+        self._last_drop_warn: int = 0
 
     async def publish(self, event: Event) -> None:
         """Publish an event to all subscribers. Best-effort: drops if a subscriber is slow."""
@@ -35,6 +42,16 @@ class EventBus:
                     q.put_nowait(event)
                 except asyncio.QueueFull:
                     self._total_dropped += 1
+                    if self._total_dropped - self._last_drop_warn >= _DROP_WARN_INTERVAL:
+                        self._last_drop_warn = self._total_dropped
+                        logger.warning(
+                            "EventBus dropped %d events total "
+                            "(%d published, %d subscribers) — "
+                            "slow subscriber cannot keep up",
+                            self._total_dropped,
+                            self._total_published,
+                            len(self._subscribers),
+                        )
 
     async def subscribe(self, max_queue: int = 5000) -> asyncio.Queue[Event]:
         """Create a new subscription queue."""

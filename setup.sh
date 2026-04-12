@@ -21,7 +21,7 @@ fi
 
 # --- Install deps ---
 echo "Installing dependencies..."
-uv pip install --python "$VENV/bin/python" pyyaml dbus-next
+uv pip install --python "$VENV/bin/python" pyyaml dbus-next aiohttp watchfiles
 
 # --- Install blutruth in editable mode ---
 uv pip install --python "$VENV/bin/python" -e .
